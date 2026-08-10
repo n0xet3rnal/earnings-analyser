@@ -1,0 +1,22 @@
+# --- Core DSPy pipeline ---
+dspy>=2.6.0            # signatures, modules, BootstrapFewShot optimizer
+litellm>=1.60.0         # LM backend DSPy uses under the hood (Gemini support)
+
+# --- LLM provider ---
+google-generativeai>=0.8.0   # Gemini Flash client (also satisfies litellm's gemini/ provider)
+
+# --- Data loading ---
+datasets>=2.20.0        # HuggingFace `load_dataset` for glopardo/sp500-earnings-transcripts
+huggingface-hub>=0.24.0
+pandas>=2.2.0
+
+# --- Config / secrets ---
+python-dotenv>=1.0.1    # load GOOGLE_API_KEY from .env
+
+# --- UI ---
+streamlit>=1.38.0
+plotly>=5.24.0
+pypdf>=5.0.0            # extract text from uploaded transcript PDFs
+
+# --- Dev / testing ---
+pytest>=8.3.0
