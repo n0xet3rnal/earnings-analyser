@@ -35,9 +35,6 @@ class Conclusion:
 
 @dataclass(frozen=True)
 class TranscriptReport:
-    ticker: str
-    company: str
-    earnings_date: str
     transcript_text: str
     conclusions: dict[str, list[Conclusion]]  # dimension -> terminal conclusions (themes)
 
@@ -48,9 +45,6 @@ class TranscriptReport:
 def build_report(
     store: GraphStore,
     transcript_text: str,
-    ticker: str,
-    company: str,
-    earnings_date: str,
     evidence_top_k: int = DEFAULT_EVIDENCE_TOP_K,
 ) -> TranscriptReport:
     conclusions: dict[str, list[Conclusion]] = {}
@@ -74,10 +68,4 @@ def build_report(
 
         conclusions[dim] = dim_conclusions
 
-    return TranscriptReport(
-        ticker=ticker,
-        company=company,
-        earnings_date=earnings_date,
-        transcript_text=transcript_text,
-        conclusions=conclusions,
-    )
+    return TranscriptReport(transcript_text=transcript_text, conclusions=conclusions)

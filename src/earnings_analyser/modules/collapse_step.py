@@ -28,7 +28,11 @@ main thread — this sidesteps SQLite's not-thread-safe-by-default
 connections entirely rather than adding locking.
 """
 
+import collections
 import itertools
+import random
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Protocol
 
@@ -41,38 +45,81 @@ DEFAULT_BRANCHING_FACTOR = 16
 DEFAULT_TARGET_TERMINAL_COUNT = 5
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MAX_WORKERS = 4
+_BACKOFF_BASE_SECONDS = 0.5
+_BACKOFF_CAP_SECONDS = 8.0
 
 
 class CollapsePredictor(Protocol):
     def __call__(self, **kwargs: Any): ...
 
 
+class RateLimiter:
+    """Sliding-window limiter: `acquire()` blocks until fewer than
+    `max_per_minute` calls have started in the trailing 60s.
+
+    Exists because a cloud provider's real per-minute quota (discovered the
+    hard way: a free-tier Gemini key caps at 15 req/min) isn't the same
+    thing as thread-pool `max_workers` — a handful of fast workers can still
+    blow a per-minute cap long before `max_workers` would suggest a problem.
+    `max_per_minute=None` disables limiting entirely (the local/Ollama
+    case — there's no external quota, just real hardware throughput, which
+    the thread pool already throttles)."""
+
+    def __init__(self, max_per_minute: int | None):
+        self._max = max_per_minute
+        self._lock = threading.Lock()
+        self._timestamps: collections.deque[float] = collections.deque()
+
+    def acquire(self) -> None:
+        if self._max is None:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._timestamps and now - self._timestamps[0] >= 60:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self._max:
+                    self._timestamps.append(now)
+                    return
+                wait = 60 - (now - self._timestamps[0])
+            time.sleep(max(wait, 0.05))
+
+
 def _format_items(texts: list[str]) -> list[str]:
     return [f"[{i}] {text}" for i, text in enumerate(texts)]
 
 
-def _predict_with_retry(predictor: CollapsePredictor, kwargs: dict[str, Any],
+def _predict_with_retry(predictor: CollapsePredictor, kwargs: dict[str, Any], rate_limiter: RateLimiter,
                          max_attempts: int = DEFAULT_MAX_ATTEMPTS):
     """A local model occasionally returns malformed structured output
-    (e.g. reaching for the wrong enum's vocabulary on one field). One bad
-    call shouldn't take down an otherwise-successful run — retry a few
-    times before giving up."""
+    (e.g. reaching for the wrong enum's vocabulary on one field); a cloud
+    backend occasionally hits a transient error even with a rate limiter in
+    front of it. One bad call shouldn't take down an otherwise-successful
+    run — retry a few times before giving up, backing off exponentially
+    (with jitter) between attempts. `rate_limiter.acquire()` gates every
+    attempt, including retries, since a retry is still a real request against
+    the same quota."""
     last_error: Exception | None = None
-    for _ in range(max_attempts):
+    for attempt in range(max_attempts):
+        rate_limiter.acquire()
         try:
             return predictor(**kwargs)
         except Exception as exc:  # dspy/pydantic validation errors, transient backend errors
             last_error = exc
+            if attempt < max_attempts - 1:
+                delay = min(_BACKOFF_CAP_SECONDS, _BACKOFF_BASE_SECONDS * (2 ** attempt))
+                time.sleep(delay + random.uniform(0, delay * 0.25))
     raise RuntimeError(f"predictor failed after {max_attempts} attempts") from last_error
 
 
-def _run_concurrently(predictor: CollapsePredictor, calls: list[dict[str, Any]], max_workers: int):
+def _run_concurrently(predictor: CollapsePredictor, calls: list[dict[str, Any]], max_workers: int,
+                       rate_limiter: RateLimiter):
     """Dispatch one `_predict_with_retry` call per entry in `calls`
-    through a thread pool — I/O-bound waiting on Ollama's HTTP response,
-    not CPU-bound, so threads (not processes) are the right stdlib tool
-    here. Returns results in the same order as `calls`."""
+    through a thread pool — I/O-bound waiting on the backend's HTTP
+    response, not CPU-bound, so threads (not processes) are the right
+    stdlib tool here. Returns results in the same order as `calls`."""
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(_predict_with_retry, predictor, kwargs) for kwargs in calls]
+        futures = [pool.submit(_predict_with_retry, predictor, kwargs, rate_limiter) for kwargs in calls]
         return [f.result() for f in futures]
 
 
@@ -138,6 +185,7 @@ def run_base_level(
     window_size: int,
     window_overlap: int,
     target: int,
+    rate_limiter: RateLimiter,
     max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> tuple[int, int]:
     """Sentence-split, group into overlapping base windows, run one
@@ -158,7 +206,7 @@ def run_base_level(
         {"group_items": _format_items([s.text for s in w.sentences]), "is_terminal": is_terminal}
         for w in windows
     ]
-    results = _run_concurrently(predictor, calls, max_workers)
+    results = _run_concurrently(predictor, calls, max_workers, rate_limiter)
 
     for window, result in zip(windows, results):
         child_ids = [f"s{s.index}" for s in window.sentences]
@@ -178,6 +226,7 @@ def run_collapse_round(
     level: int,
     branching_factor: int,
     target: int,
+    rate_limiter: RateLimiter,
     max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> int:
     """One more round: group the previous level's composites per
@@ -209,7 +258,7 @@ def run_collapse_round(
         }
         for i in range(n_groups)
     ]
-    results = _run_concurrently(bundled_predictor, calls, max_workers)
+    results = _run_concurrently(bundled_predictor, calls, max_workers, rate_limiter)
 
     for group_index, result in enumerate(results):
         for dim in DIMENSIONS:
@@ -233,22 +282,28 @@ def collapse(
     branching_factor: int = DEFAULT_BRANCHING_FACTOR,
     target: int = DEFAULT_TARGET_TERMINAL_COUNT,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    requests_per_minute: int | None = None,
 ) -> None:
     """Full orchestration: base level (`DimensionCollapse`), then
     collapse rounds (`DimensionCollapseBundled`) until each dimension is
     down to `target` terminal composites. Resumable — skips straight to
     the next level if `store.last_complete_level()` shows earlier levels
-    already finished."""
+    already finished.
+
+    One `RateLimiter` is created here and shared across every level of this
+    run — a per-minute quota is global to the whole run, not reset each
+    round, so the limiter can't be recreated per level either."""
+    rate_limiter = RateLimiter(requests_per_minute)
     resume_from = store.last_complete_level()
 
     if resume_from is None:
         level, count = run_base_level(
-            store, predictor, transcript_text, window_size, window_overlap, target, max_workers
+            store, predictor, transcript_text, window_size, window_overlap, target, rate_limiter, max_workers
         )
     else:
         level = resume_from
         count = len([n for n in store.nodes_at_level(level, kind="composite") if n.dimension == DIMENSIONS[0]])
 
     while count > target:
-        count = run_collapse_round(store, bundled_predictor, level, branching_factor, target, max_workers)
+        count = run_collapse_round(store, bundled_predictor, level, branching_factor, target, rate_limiter, max_workers)
         level += 1

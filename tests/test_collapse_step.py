@@ -3,7 +3,7 @@ import threading
 import pytest
 
 from earnings_analyser.analysis.attribution import compute_attribution
-from earnings_analyser.modules.collapse_step import collapse
+from earnings_analyser.modules.collapse_step import RateLimiter, _predict_with_retry, collapse
 from earnings_analyser.persistence.graph_store import GraphStore
 from earnings_analyser.signatures import DIMENSIONS
 
@@ -111,6 +111,65 @@ def test_resuming_skips_already_completed_levels(tmp_path):
                  window_size=4, window_overlap=1, branching_factor=3, target=3)
 
     assert calls["n"] == first_run_calls
+
+
+def test_predict_with_retry_backs_off_between_attempts(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("earnings_analyser.modules.collapse_step.time.sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr("earnings_analyser.modules.collapse_step.random.uniform", lambda a, b: 0.0)
+
+    attempts = {"n": 0}
+
+    def flaky(**kwargs):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RuntimeError("transient")
+        return "ok"
+
+    result = _predict_with_retry(flaky, {}, RateLimiter(None), max_attempts=3)
+
+    assert result == "ok"
+    assert attempts["n"] == 3
+    # backs off before the 2nd and 3rd attempts, not after the final success
+    assert sleeps == [0.5, 1.0]
+
+
+def test_predict_with_retry_raises_after_exhausting_attempts(monkeypatch):
+    monkeypatch.setattr("earnings_analyser.modules.collapse_step.time.sleep", lambda s: None)
+
+    def always_fails(**kwargs):
+        raise RuntimeError("still broken")
+
+    with pytest.raises(RuntimeError, match="failed after 2 attempts"):
+        _predict_with_retry(always_fails, {}, RateLimiter(None), max_attempts=2)
+
+
+def test_rate_limiter_disabled_when_max_is_none():
+    limiter = RateLimiter(None)
+    # should return immediately, no matter how many times it's called
+    for _ in range(50):
+        limiter.acquire()
+
+
+def test_rate_limiter_throttles_to_max_per_minute(monkeypatch):
+    fake_now = {"t": 0.0}
+    monkeypatch.setattr("earnings_analyser.modules.collapse_step.time.monotonic", lambda: fake_now["t"])
+    sleeps = []
+
+    def fake_sleep(s):
+        sleeps.append(s)
+        fake_now["t"] += s
+
+    monkeypatch.setattr("earnings_analyser.modules.collapse_step.time.sleep", fake_sleep)
+
+    limiter = RateLimiter(2)
+    limiter.acquire()
+    limiter.acquire()
+    # a 3rd call within the same 60s window must wait, not proceed immediately
+    limiter.acquire()
+
+    assert sleeps  # it actually waited
+    assert fake_now["t"] >= 60
 
 
 def test_collapse_round_uses_one_call_per_group_not_per_dimension(tmp_path):

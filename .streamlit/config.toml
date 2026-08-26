@@ -2,8 +2,15 @@
 toolbarMode = "minimal"
 
 [theme]
-primaryColor = "#2a78d6"
-backgroundColor = "#fcfcfb"
-secondaryBackgroundColor = "#f9f9f7"
-textColor = "#0b0b0b"
-font = "sans serif"
+base = "dark"
+primaryColor = "#7C5CFF"
+backgroundColor = "#0B1330"
+secondaryBackgroundColor = "#141B3D"
+textColor = "#F4F3FA"
+font = "sans-serif"
+headingFont = "Source Serif 4:https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,300;8..60,400;8..60,500&display=swap, serif"
+headingFontWeights = 300
+baseRadius = "1rem"
+buttonRadius = "full"
+borderColor = "#2A3363"
+showWidgetBorder = true
