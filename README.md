@@ -1,115 +1,101 @@
 # Earnings Call Analyzer
 
-Scores earnings call transcripts across six linguistic dimensions drawn from academic research on analyst communication, for use as a stock screening signal. Built with DSPy against Google Gemini.
+Analyzes earnings call transcripts across six linguistic dimensions drawn from academic research on analyst communication. Runs entirely locally against a small open-weight model via Ollama — no cloud API key required. Every conclusion cites specific, located sentences from the transcript; nothing is asserted without a traceable source.
 
 ## Academic basis
 
-**Matera 2024** ([arXiv:2511.15214](https://arxiv.org/abs/2511.15214)) defines the six scoring dimensions used here: Forward Guidance, Uncertainty, Confidence, Sentiment, Macro Focus, and Jargon. Its central finding is that analysts systematically underweight uncertainty language when interpreting a call. This project follows that finding directly: the composite score weights Uncertainty twice as heavily as most other dimensions.
+**Matera 2024** ([arXiv:2511.15214](https://arxiv.org/abs/2511.15214)) defines the six dimensions used here: Forward Guidance, Uncertainty, Confidence, Sentiment, Macro Focus, and Jargon.
 
-**"Fast Numbers, Slow Language"** ([arXiv:2606.29734](https://arxiv.org/abs/2606.29734)) provides the scoring scale used for each dimension (a bounded range from strongly negative to strongly positive, discretized here into five anchor levels) and establishes that the Q&A portion of a call carries more signal than the prepared remarks. The composite score reflects this too: Q&A is weighted 60/40 over prepared remarks.
+**"Fast Numbers, Slow Language"** ([arXiv:2606.29734](https://arxiv.org/abs/2606.29734)) informed the discrete five-anchor label scale (`strong_negative`..`strong_positive`) used per theme.
+
+There is no numeric composite score. Earlier iterations of this project scored each dimension as an average float and combined the six into a single weighted number — those weights were never validated against anything, and averaging LLM-classified labels manufactures precision that isn't there. This version replaces that with grounded, cited narrative themes plus a coarse label per theme.
 
 ## What it does
 
-Given a transcript (pasted text or an uploaded PDF), the pipeline:
+1. **Sentence split.** The transcript is deterministically split into sentences, each with a real, absolute offset into the source text — no model involved.
+2. **Base grouping.** Sentences are grouped into small overlapping windows (~4-5 sentences, sharing one sentence with each neighbor).
+3. **Recursive collapse.** One call per group produces, for all six dimensions at once: a relevance weight for each input sentence/composite, and a short grounded composite passage. The same call is reused recursively — composites from one round become inputs to the next — until each dimension is down to a handful (~4-5) of terminal themes, each carrying a coarse label.
+4. **Deterministic attribution.** After the collapse finishes, a pure-code pass (no model call) chains every round's relevance weights together to compute exactly how much each original sentence contributed to each final theme — a real, computable importance score, not just "cited or not."
+5. **UI.** Streamlit shows each dimension's themes as cards (label + narrative); clicking one renders the full transcript with a heatmap — sentence highlight intensity proportional to that sentence's computed importance to the selected theme.
 
-1. Splits the transcript into prepared remarks and Q&A.
-2. Scores each section independently across all six dimensions.
-3. Combines the twelve resulting scores into a single composite, upweighting uncertainty and the Q&A section per the papers above.
-4. Surfaces the evidence behind every score: verbatim quotes located and verified in the original transcript, not paraphrased summaries.
+## Why this shape
 
-The output is a Streamlit app showing the composite score, a per-dimension breakdown chart, and the full transcript with the evidence for whichever dimension you're inspecting highlighted in place.
-
-## Approach
-
-### Discrete scoring instead of raw floats
-
-Each dimension is scored by asking Gemini to classify a section into one of five discrete levels (`strong_negative`, `mild_negative`, `neutral`, `mild_positive`, `strong_positive`), which map to fixed values (-1.0, -0.3, 0.0, 0.3, 1.0). This was a deliberate choice over asking the model to output a raw number directly. LLMs are reasonably reliable classifiers but not reliable at inventing calibrated continuous numbers on the fly, and a fixed five-point scale matches how the source papers actually define their anchors.
-
-### Self-consistency for reliability
-
-Gemini's output is not fully deterministic even at `temperature=0`. This was confirmed empirically during development: identical inputs occasionally produced different labels on repeated calls. To compensate, each section is scored multiple times (3 by default, configurable) at a moderate temperature with caching disabled, and the majority label is taken. The fraction of samples agreeing with the majority is recorded as an `agreement` score, which doubles as a rough confidence signal in the UI.
-
-### Verified evidence, not trusted quotes
-
-Each dimension score is accompanied by short verbatim quotes the model claims support its judgment. These are not taken on trust. Every quote is checked against the actual source text (tolerant of whitespace and smart-quote differences, not tolerant of altered wording), and only verified quotes are highlighted in the transcript view. Quotes that fail verification are shown but flagged, since this usually means the model paraphrased rather than quoted. Evidence is pooled across all self-consistency samples that agreed with the majority label rather than taken from a single sample, since different samples often surface different valid supporting passages even when they reach the same conclusion.
-
-### Two-stage transcript splitting
-
-Splitting a transcript into prepared remarks and Q&A is not done with fixed regex patterns as the primary method, since transcript formatting varies by source (different vendors, company-published PDFs, OCR output). Instead, a DSPy signature reads the transcript and returns a short verbatim marker for where Q&A begins; that marker is then located in the source text using the same verification approach as evidence quotes, and the split happens at that exact, confirmed offset. A regex-based splitter (tuned against the demo dataset's phrasing conventions) exists only as a fallback if the model call fails outright.
-
-### Composite scoring
-
-Each dimension is scored in its own natural direction (for example, Uncertainty scores higher when there is more hedging, not less). A per-dimension sign flag determines whether a high raw score is bullish or bearish before it enters the weighted composite, keeping each dimension's own meaning intuitive while still producing a single directional score.
+- **Sentence-level, not whole-section.** A single call judging six dimensions over an entire ~20k-word section is the wrong task for a small local model. Judging six dimensions over 4-5 sentences at a time is a much easier, more reliable task — and the same signature is reused recursively at every level, so the total interface stays small.
+- **Classification, not floats.** Both the relevance weights (`none/weak/moderate/strong`) and the per-theme labels are discrete classifications. Local models are reliable classifiers; they are not reliable at inventing calibrated numbers, and nothing in this pipeline asks them to.
+- **Citations by construction, not by verification.** The model never reproduces transcript text — it references inputs by index. There is nothing to hallucinate or fuzzy-match against the source, because nothing above the leaf (sentence) layer ever claims to *be* source text.
+- **One label per theme, not one per dimension.** Aggregating several themes' labels into a single dimension-level verdict reintroduces exactly the majority-vote-with-ties problem an earlier version of this codebase had (label and score silently disagreeing). Each theme keeps its own label instead.
 
 ## Tech stack
 
-- **DSPy** for structured LLM signatures and (eventually) prompt optimization
-- **Google Gemini** (`gemini-flash-lite-latest`) as the underlying model, accessed through DSPy's LM wrapper (litellm)
-- **Streamlit** for the UI, with Plotly for the dimension breakdown charts
-- **HuggingFace `datasets`**, specifically `glopardo/sp500-earnings-transcripts`, as a calibration corpus (not a live data source; see Limitations)
-- **pypdf** for PDF text extraction
-- **uv** for dependency management, `requirements.txt` for the tracked dependency list
+- **DSPy** for structured signatures — kept specifically because a future prompt-optimization pass (a larger model generating training data, `BootstrapFewShot` compiling it into few-shot demonstrations for the local model) depends on it directly.
+- **Ollama**, serving a local model (default: Qwen3-4B-Instruct) through an OpenAI-compatible endpoint. Benchmarked against Qwen2.5-7B-Instruct Q4_K_M with caching disabled and identical terse-summary prompts on both: Qwen3-4B ran ~25-30% faster (~33s vs. ~43-45s on a 12-sentence test transcript) thanks to a real per-token speed advantage (65.6 tok/s vs. 31.8 tok/s measured directly against Ollama).
+- **SQLite (WAL mode)** as the graph store — nodes and edges for every collapse level, written incrementally so a live viewer can read the graph while the pipeline is still building it, and so an interrupted run resumes instead of restarting.
+- **Streamlit** for the UI, **Plotly**-free now (no composite score to chart); **pypdf** for PDF transcript extraction.
 
 ## Project structure
 
 ```
-app.py                          Streamlit UI
+app.py                          Streamlit UI — theme cards + evidence heatmap
 src/earnings_analyser/
-  config.py                     DSPy + Gemini configuration
-  pipeline.py                   End-to-end orchestration: split -> score -> aggregate
-  composite.py                  Weighted aggregation of per-dimension, per-section scores
-  report.py                     Serializable report structure consumed by the UI
-  text_matching.py              Verified substring location, used for evidence and section splitting
+  config.py                     DSPy + local Ollama configuration
+  pipeline.py                   Wires a live predictor to the collapse orchestration
+  report.py                     Builds the {dimension: [themes]} shape the UI consumes
   data/
-    loader.py                   HuggingFace dataset loading (calibration use only)
+    sentence_split.py           Deterministic sentence split + overlapping base windows
     pdf_extract.py               PDF to text extraction
-    splitter.py                  Regex-based transcript splitter (fallback only)
-  modules/
-    section_scorer.py           Runs the scoring signature with self-consistency voting
-    section_splitter.py         LLM-based transcript splitter (primary)
   signatures/
-    dimension_scores.py         The combined 6-dimension DSPy signature
-    section_boundary.py         The Q&A boundary-detection signature
-    common.py                   Shared scoring scale and dimension metadata
-scripts/                        Manual smoke-test scripts used during development
+    dimension_collapse.py       The one recurring signature: 6-dimension relevance + summary + (terminal) label
+    common.py                    Shared label scale and dimension list
+  modules/
+    collapse_step.py            One level of the recursion, and the full orchestration loop
+  analysis/
+    attribution.py               Pure-code weighted-path attribution (no model calls)
+  persistence/
+    graph_store.py               SQLite/WAL-backed node/edge store, resumable
+scripts/
+  smoke_test.py                  Manual check that the local Ollama endpoint is reachable
+tests/                           pytest coverage for the deterministic parts (offsets, graph store, attribution math)
 ```
 
 ## Setup
 
-Requires Python 3.12 and a Google Gemini API key.
+Requires Python 3.12 and a local [Ollama](https://ollama.com) install.
 
 ```bash
-uv venv --python 3.12 .venv
-uv pip install -r requirements.txt --python .venv/bin/python
+ollama pull qwen2.5:7b-instruct-q4_K_M
+ollama serve   # if not already running
+
+python -m venv .venv
+.venv/bin/python -m pip install -e ".[dev]"
 ```
 
-Create a `.env` file in the project root:
-
-```
-GOOGLE_API_KEY=your-key-here
-```
+Use `.venv/bin/python -m <tool>` rather than `.venv/bin/<tool>` directly — a venv's console scripts hardcode their creation path in the shebang line, so `.venv/bin/streamlit` (etc.) breaks with "file not found" if the project directory is ever moved or renamed after the venv was created; invoking through `python -m` doesn't have that problem.
 
 ## Running the app
 
 ```bash
-.venv/bin/streamlit run app.py
+.venv/bin/python -m streamlit run app.py
 ```
 
-Paste transcript text or upload a PDF in the sidebar, then click Analyze.
+Paste transcript text or upload a PDF in the sidebar, click Analyze, then pick a dimension and click a theme card to see its evidence heatmap.
+
+## Running tests
+
+```bash
+.venv/bin/python -m pytest tests/
+```
+
+All current tests are pure — no network or live model required. They cover sentence-split offset correctness (including window overlap), the graph store's read/write/resumability behavior, and the attribution math (single-level weights, multi-level chains, and multi-parent convergence at overlapping window boundaries).
 
 ## Current status
 
-Working end to end: transcript ingestion (paste or PDF), section splitting, six-dimension scoring, composite aggregation, and the two-pane UI with verified evidence highlighting.
+Implemented: sentence split, overlapping base windows, the merged collapse signature, the recursive collapse orchestration with resumability, deterministic attribution, the SQLite/WAL graph store, and the Streamlit UI (theme cards + heatmap).
 
-Not yet built:
+Not yet done:
 
-- **Optimization.** DSPy's `BootstrapFewShot` has not been run yet. The plan is to calibrate against a proxy metric derived from the dataset (change in forward-12-month EPS estimates between consecutive quarters for the same ticker), since the dataset does not contain a direct EPS-surprise field.
-- **Price-reaction validation.** A secondary validation metric based on post-earnings stock price movement (via a market data API) is planned but not implemented.
-- **Automated tests.** Current verification has been manual and script-based (see `scripts/`), not a pytest suite.
+- **Empirical tuning.** Branching factor per collapse round, and behavior on very short transcripts, are set to reasonable defaults but not yet tuned against real transcripts.
+- **Concurrency's real ceiling.** Client-side thread-pool concurrency for independent collapse calls is implemented, but measured only a ~4% wall-clock improvement on this hardware (6GB GPU, model already using ~4.77GB VRAM) — Ollama appears to serialize requests server-side regardless of client concurrency here. The code is correct and harmless but isn't the win it might look like on paper; call-count reduction (branching factor, window size) matters more than parallelism on this setup.
+- **DSPy prompt optimization.** A separate, not-yet-started workstream: generate training data with a larger teacher model, compile it into few-shot demonstrations for the local model via `BootstrapFewShot`.
+- **Live graph visualization.** The graph store's SQLite/WAL design supports a concurrent reader while the pipeline writes, but no viewer has been built yet.
 
-## Limitations
-
-- The bundled dataset (`glopardo/sp500-earnings-transcripts`) covers 2013-05 to 2025-02 and is a static snapshot, not a live feed. It is used only for development calibration, not as an input source in the app itself.
-- The regex fallback splitter was validated against that dataset's specific formatting and will not generalize as well as the primary LLM-based splitter to arbitrary transcript sources.
-- Self-consistency reduces but does not eliminate scoring variance between runs on the same input.
-- PDF text extraction does not handle scanned images without OCR.
+See `implementation-plan.md` for the full architecture writeup and the reasoning behind each decision.

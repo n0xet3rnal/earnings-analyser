@@ -1,12 +1,9 @@
-"""Sanity check: DSPy can reach Gemini Flash with the configured API key.
+"""Sanity check: DSPy can reach the configured local Ollama endpoint.
 
 Run with: .venv/bin/python scripts/smoke_test.py
+Requires `ollama serve` running locally with the configured model pulled
+(see `src/earnings_analyser/config.py`'s DEFAULT_MODEL).
 """
-
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import dspy
 
@@ -23,7 +20,7 @@ def main() -> None:
     configure_dspy()
     predictor = dspy.Predict(Ping)
     result = predictor()
-    print("Gemini Flash responded:", result.note)
+    print("Local model responded:", result.note)
 
 
 if __name__ == "__main__":

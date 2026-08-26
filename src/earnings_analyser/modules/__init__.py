@@ -1,4 +1,3 @@
-from .section_scorer import DimensionResult, EvidenceQuote, SectionScorer, SectionScores
-from .section_splitter import SectionSplitter
+from .collapse_step import DEFAULT_BRANCHING_FACTOR, DEFAULT_TARGET_TERMINAL_COUNT, collapse
 
-__all__ = ["DimensionResult", "EvidenceQuote", "SectionScorer", "SectionScores", "SectionSplitter"]
+__all__ = ["collapse", "DEFAULT_BRANCHING_FACTOR", "DEFAULT_TARGET_TERMINAL_COUNT"]

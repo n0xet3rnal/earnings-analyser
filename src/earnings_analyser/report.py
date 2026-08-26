@@ -1,102 +1,83 @@
-"""Structured, serializable report combining pipeline scores + composite +
-transcript metadata — the shape the UI (and any future API layer) consumes.
+"""Structured report the UI consumes: per dimension, the terminal
+conclusions produced by the collapse (implementation-plan.md §2.3), each
+with its own label, narrative, and cited evidence.
 
-Evidence spans arrive relative to whichever section they were scored
-against; this module shifts them to be relative to the *full* transcript
-(`transcript_text`) so the UI can highlight evidence directly in the
-original document regardless of which section it came from.
+Evidence is always a source sentence resolved by id through the graph
+store — never re-quoted or reproduced by a model at this stage (see
+`analysis/attribution.py`'s docstring) — with the attribution weight
+attached so the UI can render the heatmap directly from this shape.
 """
 
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from .composite import compute_composite
-from .data.loader import TranscriptRecord
-from .modules.section_scorer import EvidenceQuote, SectionScores
-from .pipeline import TranscriptScores
-from .signatures import AGGREGATION_SIGN, DIMENSIONS
+from .analysis.attribution import compute_attribution
+from .persistence.graph_store import GraphStore
+from .signatures import DIMENSIONS
+
+DEFAULT_EVIDENCE_TOP_K = 8
 
 
 @dataclass(frozen=True)
-class DimensionReportEntry:
-    label: str
-    raw_score: float  # in the dimension's own natural direction
-    bullish_score: float  # sign-adjusted, used in composite math
-    agreement: float
-    rationale: str
-    evidence: list[EvidenceQuote]  # start/end are absolute offsets into transcript_text
+class EvidenceEntry:
+    text: str
+    start: int
+    end: int
+    weight: float  # this conclusion's attribution weight for this sentence
 
 
 @dataclass(frozen=True)
-class SectionReport:
-    section_type: str
-    bullish_score: float
-    dimensions: dict[str, DimensionReportEntry]
+class Conclusion:
+    label: str | None
+    narrative: str
+    evidence: list[EvidenceEntry]
 
 
 @dataclass(frozen=True)
 class TranscriptReport:
     ticker: str
     company: str
-    sector: str
     earnings_date: str
     transcript_text: str
-    composite_score: float
-    split_confidence: str
-    dimension_contributions: dict[str, float]
-    sections: dict[str, SectionReport]
+    conclusions: dict[str, list[Conclusion]]  # dimension -> terminal conclusions (themes)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
-def _shift_evidence(evidence: list[EvidenceQuote], base_offset: int) -> list[EvidenceQuote]:
-    return [
-        EvidenceQuote(
-            text=q.text,
-            start=q.start + base_offset if q.start is not None else None,
-            end=q.end + base_offset if q.end is not None else None,
-        )
-        for q in evidence
-    ]
+def build_report(
+    store: GraphStore,
+    transcript_text: str,
+    ticker: str,
+    company: str,
+    earnings_date: str,
+    evidence_top_k: int = DEFAULT_EVIDENCE_TOP_K,
+) -> TranscriptReport:
+    conclusions: dict[str, list[Conclusion]] = {}
 
+    for dim in DIMENSIONS:
+        attribution = compute_attribution(store, dim)
+        dim_conclusions = []
 
-def _section_report(section: SectionScores, bullish_score: float, base_offset: int) -> SectionReport:
-    dimensions = {
-        dim: DimensionReportEntry(
-            label=section.dimensions[dim].label,
-            raw_score=section.dimensions[dim].score,
-            bullish_score=AGGREGATION_SIGN[dim] * section.dimensions[dim].score,
-            agreement=section.dimensions[dim].agreement,
-            rationale=section.dimensions[dim].rationale,
-            evidence=_shift_evidence(section.dimensions[dim].evidence, base_offset),
-        )
-        for dim in DIMENSIONS
-    }
-    return SectionReport(section_type=section.section_type, bullish_score=bullish_score, dimensions=dimensions)
+        for terminal in store.terminal_nodes(dim):
+            leaf_weights = attribution.get(terminal.node_id, {})
+            top = sorted(leaf_weights.items(), key=lambda kv: kv[1], reverse=True)[:evidence_top_k]
 
+            evidence = []
+            for sentence_id, weight in top:
+                sentence = store.get_node(sentence_id)
+                if sentence is None or sentence.start is None or sentence.end is None:
+                    continue
+                evidence.append(EvidenceEntry(text=sentence.text, start=sentence.start, end=sentence.end, weight=weight))
 
-def build_report(record: TranscriptRecord, scores: TranscriptScores) -> TranscriptReport:
-    composite = compute_composite(scores)
+            dim_conclusions.append(Conclusion(label=terminal.label, narrative=terminal.text, evidence=evidence))
 
-    sections = {
-        "prepared_remarks": _section_report(
-            scores.prepared_remarks,
-            composite.section_scores["prepared_remarks"],
-            scores.prepared_remarks_offset,
-        )
-    }
-    if scores.qa is not None:
-        sections["qa"] = _section_report(scores.qa, composite.section_scores["qa"], scores.qa_offset)
+        conclusions[dim] = dim_conclusions
 
     return TranscriptReport(
-        ticker=record.ticker,
-        company=record.company,
-        sector=record.sector,
-        earnings_date=record.earnings_date,
-        transcript_text=scores.transcript_text,
-        composite_score=composite.composite_score,
-        split_confidence=scores.split_confidence,
-        dimension_contributions=composite.dimension_contributions,
-        sections=sections,
+        ticker=ticker,
+        company=company,
+        earnings_date=earnings_date,
+        transcript_text=transcript_text,
+        conclusions=conclusions,
     )

@@ -1,14 +1,4 @@
-from .common import AGGREGATION_SIGN, ANCHOR_SCORES, DIMENSIONS, ScoreLabel, score_of
-from .dimension_scores import DimensionScores, SectionType
-from .section_boundary import SectionBoundary
+from .common import DIMENSIONS, ScoreLabel
+from .dimension_collapse import MAX_RELEVANCE_SCORE, DimensionCollapse, DimensionCollapseBundled
 
-__all__ = [
-    "AGGREGATION_SIGN",
-    "ANCHOR_SCORES",
-    "DIMENSIONS",
-    "ScoreLabel",
-    "score_of",
-    "DimensionScores",
-    "SectionType",
-    "SectionBoundary",
-]
+__all__ = ["DIMENSIONS", "ScoreLabel", "DimensionCollapse", "DimensionCollapseBundled", "MAX_RELEVANCE_SCORE"]
