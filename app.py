@@ -5,24 +5,33 @@ Requires a local Ollama server running the configured model (see
 `src/earnings_analyser/config.py`), or a cloud `dspy.LM` wired up in
 `config.configure_dspy()`.
 
-Three phases, tracked in `st.session_state["phase"]`:
-  input      — paste/upload a transcript.
-  analyzing  — `run_pipeline` runs in a background thread while an
-               `st.fragment` polls the (WAL-mode) GraphStore every 1s
-               and redraws the graph as levels complete.
-  complete   — final report + graph with dimension-tab highlighting.
+Two top-level phases, tracked in `st.session_state["phase"]`:
+  input — paste/upload a transcript.
+  (anything else) — `render_graph_phase`, one `st.fragment` that covers
+      both "analyzing" and "complete" internally via `status["done"]`,
+      never crossing a full `st.rerun()` between them. `run_pipeline` runs
+      in a background thread while the fragment polls the (WAL-mode)
+      GraphStore every 1s and streams new nodes into the graph component
+      as levels complete; once done, the same fragment starts rendering
+      the report panel and dimension-tab highlighting instead — kept in
+      one fragment specifically so the graph's iframe is never torn down
+      and remounted at that transition (see `render_graph_phase`).
 """
 
 import hashlib
+import html
 import tempfile
 import threading
+import time
 import traceback
 from pathlib import Path
 
 import streamlit as st
 
-from earnings_analyser.config import configure_dspy
+from earnings_analyser.analysis.attribution import compute_node_weights
+from earnings_analyser.config import BACKEND_PROFILES, configure_dspy
 from earnings_analyser.data.pdf_extract import extract_pdf_text
+from earnings_analyser.modules.collapse_step import estimate_call_count
 from earnings_analyser.persistence.graph_store import GraphStore
 from earnings_analyser.pipeline import run_pipeline
 from earnings_analyser.report import build_report
@@ -31,14 +40,16 @@ from earnings_analyser.ui.graph_component import render_graph
 
 # Dimension color lives only inside the graph — one continuous cool arc
 # so it reads as a coherent aurora, not a six-color legend. App chrome
-# (panels, tabs, buttons) stays navy/violet/paper via .streamlit/config.toml.
+# (panels, tabs, buttons) stays purple-on-black via .streamlit/config.toml.
+# Kept within a jewel-toned, cool family close to the app's own violet
+# accent (#8B5CF6) rather than a wide rainbow — no warm oranges/yellows.
 DIM_COLORS = {
-    "forward_guidance": "#5EEAD4",
-    "sentiment": "#818CF8",
-    "macro_focus": "#38BDF8",
-    "jargon": "#C084FC",
-    "uncertainty": "#A78BFA",
-    "confidence": "#F472B6",
+    "forward_guidance": "#2DD4BF",
+    "sentiment": "#8B7CF6",
+    "macro_focus": "#5B8DEF",
+    "jargon": "#B565F0",
+    "uncertainty": "#9D7BEB",
+    "confidence": "#D6669B",
 }
 DIMENSION_LABELS = {
     "forward_guidance": "Forward Guidance",
@@ -49,7 +60,7 @@ DIMENSION_LABELS = {
     "jargon": "Jargon",
 }
 
-st.set_page_config(page_title="Constellation — Earnings Call Analyzer", layout="wide")
+st.set_page_config(page_title="Earnings Call Analysis", layout="wide")
 
 # Rounding/backoff and color come from .streamlit/config.toml's native theme
 # options; this covers only what theme.toml has no knob for — smooth hover/
@@ -63,14 +74,14 @@ st.markdown(
       .stButton > button, .stDownloadButton > button {
         transition: transform 0.15s ease, box-shadow 0.15s ease;
       }
-      .stButton > button:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(124,92,255,0.28); }
+      .stButton > button:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(139,92,246,0.28); }
       .stButton > button:active { transform: translateY(0); }
 
       div[data-testid="stVerticalBlockBorderWrapper"] {
         transition: box-shadow 0.2s ease, border-color 0.2s ease;
       }
       div[data-testid="stVerticalBlockBorderWrapper"]:hover {
-        box-shadow: 0 8px 28px rgba(11,19,48,0.4);
+        box-shadow: 0 8px 28px rgba(0,0,0,0.5);
       }
 
       .stTabs [data-baseweb="tab"] {
@@ -81,7 +92,31 @@ st.markdown(
     div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 1.1rem !important; }
     [data-testid="stExpander"] { border-radius: 1rem !important; overflow: hidden; }
     .stTabs [data-baseweb="tab-list"] { gap: 4px; }
-    .stTabs [aria-selected="true"] { background: rgba(124,92,255,0.18); }
+    .stTabs [aria-selected="true"] { background: rgba(139,92,246,0.18); }
+
+    /* Dimension picker: a plain st.radio, restyled to read as a vertical
+       tab list (left accent bar, no radio dot) rather than a form control. */
+    div[data-testid="stRadio"] > div[role="radiogroup"] {
+      flex-direction: column;
+      gap: 2px;
+    }
+    div[data-testid="stRadio"] label[data-testid="stRadioOption"] {
+      padding: 10px 12px;
+      border-radius: 0.6rem;
+      border-left: 3px solid transparent;
+      line-height: 1.25;
+      transition: background 0.2s ease, border-color 0.2s ease;
+    }
+    div[data-testid="stRadio"] label[data-testid="stRadioOption"]:hover {
+      background: rgba(139,92,246,0.08);
+    }
+    div[data-testid="stRadio"] label[data-testid="stRadioOption"][data-selected="true"] {
+      background: rgba(139,92,246,0.18);
+      border-left-color: #8B5CF6;
+    }
+    div[data-testid="stRadio"] label[data-testid="stRadioOption"] > div > div > div:first-child {
+      display: none;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -109,6 +144,8 @@ def _node_payload(node) -> dict:
         "dimension": node.dimension,
         "text": node.text,
         "terminal": node.terminal,
+        "start": node.start,
+        "end": node.end,
     }
 
 
@@ -139,19 +176,90 @@ def _sync_graph_data(store: GraphStore) -> int | None:
     return last_level
 
 
-def _start_analysis(transcript_text: str) -> None:
-    lm, pipeline_profile, _backend = get_lm()
-    digest = hashlib.sha1(transcript_text.encode("utf-8")).hexdigest()[:16]
+def _replay_cached_run(cache_store: GraphStore, dest_store: GraphStore, status: dict, pace: float = 0.6) -> None:
+    """Re-plays a previously-completed run into a fresh store, level by
+    level with a pause between — same shape the live pipeline writes in,
+    so the polling fragment streams it exactly like a real run. Lets UI
+    changes get exercised repeatedly without spending LLM calls/rate limit.
+
+    No real LLM calls happen here, but `status["calls_done"]` still
+    advances (one "call" per `len(DIMENSIONS)` composites written at a
+    level — matches how `collapse_step._write_dimension_result` actually
+    writes one composite per dimension per call) so the progress bar
+    stays meaningful while testing against the fixture instead of just
+    sitting dark for that path. Single-threaded (unlike the real
+    pipeline's worker pool), so no lock needed for this increment."""
+    seen_ids: set[str] = set()
+    all_edges = [e for dim in DIMENSIONS for e in cache_store.edges_for_dimension(dim)]
+
+    nodes0 = cache_store.nodes_at_level(0)
+    dest_store.add_nodes(nodes0)
+    seen_ids.update(n.node_id for n in nodes0)
+
+    last_level = cache_store.last_complete_level() or 0
+    for level in range(1, last_level + 1):
+        time.sleep(pace)
+        nodes = cache_store.nodes_at_level(level)
+        dest_store.add_nodes(nodes)
+        seen_ids.update(n.node_id for n in nodes)
+        dest_store.add_edges([e for e in all_edges if e.child in seen_ids and e.parent in seen_ids])
+        dest_store.mark_level_complete(level)
+        status["calls_done"] += len(nodes) // len(DIMENSIONS)
+
+
+FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "sample_run.sqlite"
+# scripts/generate_ui_fixture.py builds the fixture DB from this exact
+# file — every node's start/end offset in it is relative to this text, not
+# to a placeholder string, so the transcript-jump feature needs the real
+# thing here too.
+FIXTURE_TRANSCRIPT_PATH = Path(__file__).resolve().parent / "fixtures" / "sample_transcript.txt"
+
+
+def _estimated_calls(transcript_text: str, pipeline_profile: dict) -> int:
+    return estimate_call_count(
+        transcript_text,
+        window_size=pipeline_profile["window_size"],
+        window_overlap=pipeline_profile["window_overlap"],
+        branching_factor=pipeline_profile["branching_factor"],
+        target=pipeline_profile["target"],
+    )
+
+
+def _start_analysis(transcript_text: str = "", use_fixture: bool = False) -> None:
+    digest = hashlib.sha1((transcript_text or "fixture").encode("utf-8")).hexdigest()[:16]
     db_path = Path(tempfile.gettempdir()) / f"earnings-analyser-{digest}.sqlite"
     for stale in db_path.parent.glob(db_path.name + "*"):
         stale.unlink(missing_ok=True)  # always watch a fresh build, even for a repeat transcript
 
-    status = {"done": False, "error": None, "report": None}
+    # Computed up front (cheap — pure arithmetic, see estimate_call_count)
+    # so the progress bar has a real denominator from the very first poll
+    # tick, not just once the first level lands. The fixture path was
+    # always generated against the cloud profile (scripts/generate_ui_fixture.py),
+    # regardless of whatever backend is currently configured, so its
+    # estimate uses that profile specifically rather than get_lm()'s.
+    if use_fixture:
+        calls_total = _estimated_calls(FIXTURE_TRANSCRIPT_PATH.read_text(), BACKEND_PROFILES["cloud"]["pipeline"])
+    else:
+        _lm, pipeline_profile, _backend = get_lm()
+        calls_total = _estimated_calls(transcript_text, pipeline_profile)
+
+    status = {"done": False, "error": None, "report": None, "calls_done": 0, "calls_total": calls_total}
+    progress_lock = threading.Lock()  # ThreadPoolExecutor workers call this concurrently; += isn't atomic on its own
+
+    def _on_progress() -> None:
+        with progress_lock:
+            status["calls_done"] += 1
 
     def _worker() -> None:
         try:
             with GraphStore(db_path) as store:
-                run_pipeline(store, transcript_text, lm=lm, **pipeline_profile)
+                if use_fixture:
+                    with GraphStore(FIXTURE_PATH) as fixture_store:
+                        _replay_cached_run(fixture_store, store, status)
+                    transcript_text = FIXTURE_TRANSCRIPT_PATH.read_text()
+                else:
+                    lm, pipeline_profile, _backend = get_lm()
+                    run_pipeline(store, transcript_text, lm=lm, on_progress=_on_progress, **pipeline_profile)
                 report = build_report(store, transcript_text)
             status["report"] = report.to_dict()
         except Exception:  # surfaced to the polling fragment via this shared dict
@@ -170,85 +278,178 @@ def _start_analysis(transcript_text: str) -> None:
 
 
 def render_input_phase() -> None:
-    last_error = st.session_state.pop("last_error", None)
-    if last_error:
-        st.error("Analysis failed. Details:")
-        st.code(last_error, language="text")
+    # Centered, not stretched edge-to-edge — a form this short doesn't
+    # need the full width of a wide layout.
+    _left, center, _right = st.columns([1, 2, 1])
+    with center:
+        last_error = st.session_state.pop("last_error", None)
+        if last_error:
+            st.error("Analysis failed. Details:")
+            st.code(last_error, language="text")
 
-    tab_paste, tab_pdf = st.tabs(["Paste transcript", "Upload PDF"])
-    transcript_text = None
+        tab_paste, tab_pdf = st.tabs(["Paste transcript", "Upload PDF"])
+        transcript_text = None
 
-    with tab_paste:
-        pasted = st.text_area("Transcript text", height=280, key="pasted_text")
-        if st.button("Analyze", type="primary", key="analyze_paste"):
-            if not pasted.strip():
-                st.error("Paste transcript text first.")
-            else:
-                transcript_text = pasted
-
-    with tab_pdf:
-        uploaded = st.file_uploader("Transcript PDF", type=["pdf"], key="uploaded_pdf")
-        if st.button("Analyze", type="primary", key="analyze_pdf"):
-            if uploaded is None:
-                st.error("Upload a PDF first.")
-            else:
-                text = extract_pdf_text(uploaded.read())
-                if not text.strip():
-                    st.error("Couldn't extract any text from that PDF.")
+        with tab_paste:
+            pasted = st.text_area("Transcript text", height=280, key="pasted_text")
+            if st.button("Analyze", type="primary", key="analyze_paste"):
+                if not pasted.strip():
+                    st.error("Paste transcript text first.")
                 else:
-                    transcript_text = text
+                    transcript_text = pasted
 
-    if transcript_text:
-        _start_analysis(transcript_text)
-        st.rerun()
+        with tab_pdf:
+            uploaded = st.file_uploader("Transcript PDF", type=["pdf"], key="uploaded_pdf")
+            if st.button("Analyze", type="primary", key="analyze_pdf"):
+                if uploaded is None:
+                    st.error("Upload a PDF first.")
+                else:
+                    text = extract_pdf_text(uploaded.read())
+                    if not text.strip():
+                        st.error("Couldn't extract any text from that PDF.")
+                    else:
+                        transcript_text = text
+
+        if transcript_text:
+            _start_analysis(transcript_text)
+            st.rerun()
+
+        st.divider()
+        if st.button("Test with sample data (no LLM call)", key="analyze_fixture"):
+            _start_analysis(use_fixture=True)
+            st.rerun()
 
 
+GRAPH_HEIGHT = 620
+
+
+def _render_transcript_panel(transcript_text: str, selected: dict | None) -> None:
+    """Always visible, below the graph — a placeholder until a source-
+    sentence node is clicked (see the `click` handler in
+    `ui/graph_frontend/index.html`), then the full transcript with that
+    sentence highlighted and scrolled into view. A one-shot
+    `components.v1.html` render, not the persistent declared component the
+    graph uses — this doesn't need incremental state, and re-rendering a
+    short HTML blob on each click is expected, not the "no redraw" case
+    that mattered for the graph/weight-slider."""
+    st.divider()
+    st.caption("Transcript")
+    if not selected:
+        st.caption("Click a sentence node in the graph to jump to it here.")
+        return
+
+    start, end = selected["start"], selected["end"]
+    before = html.escape(transcript_text[:start])
+    target = html.escape(transcript_text[start:end])
+    after = html.escape(transcript_text[end:])
+    doc = f"""
+    <div id="transcript-scroll" style="max-height:320px;overflow-y:auto;padding:16px 20px;
+         background:#0F0D16;border:1px solid #211C2E;border-radius:0.8rem;
+         font-family:'Libre Baskerville',Georgia,serif;color:#B9B2CC;line-height:1.7;
+         white-space:pre-wrap;box-sizing:border-box;">{before}<mark id="jump-target"
+         style="background:#8B5CF6;color:#06060A;padding:0 2px;border-radius:3px;">{target}</mark>{after}</div>
+    <script>document.getElementById('jump-target').scrollIntoView({{block: 'center'}});</script>
+    """
+    st.components.v1.html(doc, height=340, scrolling=False)
+
+
+def _attach_node_weights(store: GraphStore) -> None:
+    """Per-dimension source-sentence weight (see `compute_node_weights`)
+    — computed once, right when the run completes, and patched onto the
+    already-accumulated `graph_nodes` payload so the graph component's
+    weight slider has something to threshold. Only source sentences get
+    a `weightByDim` entry — composites/terminals have no score of their
+    own; the frontend derives their visibility bottom-up from whichever
+    descendant sentences pass (see `recomputeAliveSet` in
+    `graph_frontend/index.html`). A sentence can appear under more than
+    one dimension's tree, so it gets one entry per dimension it actually
+    shows up in."""
+    weights_by_dim = {dim: compute_node_weights(store, dim) for dim in DIMENSIONS}
+    for node in st.session_state["graph_nodes"]:
+        if node["kind"] != "source_sentence":
+            continue
+        node["weightByDim"] = {
+            dim: w[node["id"]] for dim, w in weights_by_dim.items() if node["id"] in w
+        }
+
+
+# Analyzing and complete are ONE fragment, not two functions crossed by a
+# st.rerun() — that boundary was the actual cause of the jarring redraw:
+# a component inside a `st.fragment` container lives in a different DOM
+# subtree than the same call made from a plain top-level function, so even
+# with matching column layout, leaving the fragment forced Streamlit to
+# tear down and remount the graph's iframe (losing the running simulation,
+# all node positions, drag state — everything) right at the moment the
+# view is supposed to settle. Never leaving the fragment (branching
+# internally on `status["done"]` instead of flipping `st.session_state["phase"]`)
+# keeps the same component instance alive across that transition.
 @st.fragment(run_every="1s")
-def render_analyzing_phase() -> None:
+def render_graph_phase() -> None:
     status = st.session_state["analysis_status"]
+    # Always sync, even after status["done"] flips true — the worker sets
+    # that flag right after its own GraphStore closes, within microseconds
+    # of the final mark_level_complete/add_edges commit, so the poll tick
+    # that first observes done=True can otherwise be the one tick that
+    # never reads the final level's data at all (a real bug: it meant the
+    # terminal composites/hub edges for the last level sometimes never
+    # made it into graph_nodes/graph_edges before rendering stopped syncing).
     with GraphStore(st.session_state["db_path"]) as store:
         last_level = _sync_graph_data(store)
-
-    level_note = f"level {last_level} composed" if last_level else "reading the transcript..."
-    st.caption(f"Building the evidence graph — {level_note}")
-    render_graph(st.session_state["graph_nodes"], st.session_state["graph_edges"], active_dim=None, dim_colors=DIM_COLORS)
-
-    if status["done"]:
-        if status["error"] is not None:
-            st.session_state["last_error"] = status["error"]
-            st.session_state["phase"] = "input"
-        else:
+        if status["done"] and status["error"] is None and "report" not in st.session_state:
             st.session_state["report"] = status["report"]
-            st.session_state["phase"] = "complete"
             st.session_state["active_dim"] = DIMENSIONS[0]
+            _attach_node_weights(store)  # store is still open here — needed for the edge walk
+
+    if status["done"] and status["error"] is not None:
+        st.session_state["last_error"] = status["error"]
+        st.session_state["phase"] = "input"
         st.rerun()
-
-
-def render_complete_phase() -> None:
-    report = st.session_state["report"]
+        return
 
     canvas_col, panel_col = st.columns([1.5, 1], gap="large")
 
+    if not status["done"]:
+        with panel_col:
+            level_note = f"level {last_level} composed" if last_level else "reading the transcript..."
+            st.caption(f"Building the evidence graph — {level_note}")
+            calls_total = max(status["calls_total"], 1)
+            calls_done = min(status["calls_done"], calls_total)  # clamp defensively against any estimate/actual drift
+            st.progress(calls_done / calls_total, text=f"{calls_done} / {calls_total} calls")
+        with canvas_col:
+            render_graph(st.session_state["graph_nodes"], st.session_state["graph_edges"], active_dim=None, dim_colors=DIM_COLORS, height=GRAPH_HEIGHT)
+        return
+
+    report = st.session_state["report"]
     with panel_col:
-        dim = st.radio("Dimension", DIMENSIONS, format_func=lambda d: DIMENSION_LABELS[d], key="active_dim", horizontal=True)
-        themes = report["conclusions"][dim]
-        if not themes:
-            st.caption("No themes surfaced for this dimension.")
-        for theme in themes:
-            with st.container(border=True):
-                st.markdown(f"**{theme['label'] or 'Unlabeled'}**")
-                st.markdown(_escape_markdown(theme["narrative"]))
-                if theme["evidence"]:
-                    with st.expander(f"{len(theme['evidence'])} cited sentence(s)"):
-                        for q in sorted(theme["evidence"], key=lambda e: e["weight"], reverse=True):
-                            st.markdown(f"**{q['weight']:.2f}** — “{_escape_markdown(q['text'])}”")
+        tab_col, cards_col = st.columns([2, 3], gap="medium")
+        with tab_col:
+            dim = st.radio("Dimension", DIMENSIONS, format_func=lambda d: DIMENSION_LABELS[d],
+                            key="active_dim", horizontal=False, label_visibility="collapsed")
+        with cards_col:
+            themes = report["conclusions"][dim]
+            if not themes:
+                st.caption("No themes surfaced for this dimension.")
+            for theme in themes:
+                with st.container(border=True):
+                    st.markdown(f"**{theme['label'] or 'Unlabeled'}**")
+                    st.markdown(_escape_markdown(theme["narrative"]))
+                    if theme["evidence"]:
+                        with st.expander(f"{len(theme['evidence'])} cited sentence(s)"):
+                            for q in sorted(theme["evidence"], key=lambda e: e["weight"], reverse=True):
+                                st.markdown(f"**{q['weight']:.2f}** — “{_escape_markdown(q['text'])}”")
 
     with canvas_col:
-        render_graph(st.session_state["graph_nodes"], st.session_state["graph_edges"], active_dim=dim, dim_colors=DIM_COLORS, height=620)
+        clicked = render_graph(st.session_state["graph_nodes"], st.session_state["graph_edges"], active_dim=dim, dim_colors=DIM_COLORS, height=GRAPH_HEIGHT)
+        if clicked and clicked != st.session_state.get("selected_sentence"):
+            st.session_state["selected_sentence"] = clicked
+
+    _render_transcript_panel(report["transcript_text"], st.session_state.get("selected_sentence"))
 
     if st.button("Analyze another transcript"):
-        for key in ("phase", "report", "graph_nodes", "graph_edges", "levels_fetched", "active_dim"):
+        for key in ("phase", "report", "graph_nodes", "graph_edges", "levels_fetched", "active_dim",
+                    "analysis_status", "db_path", "selected_sentence"):
             st.session_state.pop(key, None)
+        st.session_state["phase"] = "input"
         st.rerun()
 
 
@@ -257,18 +458,16 @@ def main() -> None:
 
     title_col, backend_col = st.columns([4, 1])
     with title_col:
-        st.title("Constellation")
+        st.title("Earnings Call Analysis")
         st.caption("Watch the evidence graph form, dimension by dimension — sentence-grounded, no composite score.")
     with backend_col:
-        st.markdown(f"<div style='text-align:right;padding-top:1.2rem;color:#9AA1C4;'>backend: <b>{backend}</b></div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='text-align:right;padding-top:1.2rem;color:#9C93B5;'>backend: <b>{backend}</b></div>", unsafe_allow_html=True)
 
     phase = st.session_state.get("phase", "input")
     if phase == "input":
         render_input_phase()
-    elif phase == "analyzing":
-        render_analyzing_phase()
     else:
-        render_complete_phase()
+        render_graph_phase()
 
 
 if __name__ == "__main__":

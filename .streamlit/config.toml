@@ -3,14 +3,14 @@ toolbarMode = "minimal"
 
 [theme]
 base = "dark"
-primaryColor = "#7C5CFF"
-backgroundColor = "#0B1330"
-secondaryBackgroundColor = "#141B3D"
-textColor = "#F4F3FA"
-font = "sans-serif"
-headingFont = "Source Serif 4:https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,300;8..60,400;8..60,500&display=swap, serif"
-headingFontWeights = 300
+primaryColor = "#8B5CF6"
+backgroundColor = "#06060A"
+secondaryBackgroundColor = "#0F0D16"
+textColor = "#EDEAF6"
+font = "Libre Baskerville:https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap, serif"
+headingFont = "Libre Baskerville:https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap, serif"
+headingFontWeights = 700
 baseRadius = "1rem"
 buttonRadius = "full"
-borderColor = "#2A3363"
+borderColor = "#211C2E"
 showWidgetBorder = true

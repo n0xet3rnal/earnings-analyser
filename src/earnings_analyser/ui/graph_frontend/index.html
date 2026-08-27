@@ -1,0 +1,662 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+  #graph-root { width: 100%; position: relative; overflow: hidden; border-radius: 20px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.35); }
+  circle { transition: opacity 0.3s ease, fill 0.3s ease, filter 0.3s ease; }
+  line { transition: opacity 0.3s ease, stroke 0.3s ease; }
+  .node-tooltip { position: absolute; opacity: 0; visibility: hidden; width: 220px;
+    font: 12px 'Libre Baskerville', Georgia, serif; padding: 6px 8px; border-radius: 8px;
+    pointer-events: none; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,.4);
+    transition: opacity 0.12s ease; }
+</style>
+</head>
+<body>
+<div id="graph-root"></div>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script>
+// ---- Streamlit component protocol, hand-rolled (no build tooling) ----
+// Streamlit only tears down/recreates this iframe when it disappears from
+// the script (e.g. changing phase). Repeated calls from the same call site
+// (dimension switch, next poll tick) instead deliver a "render" postMessage
+// to this already-alive page — that persistence is the whole point: it's
+// what lets a dimension switch restyle in place and lets new streamed nodes
+// join a simulation that's already settled, instead of the previous
+// components.v1.html design which destroyed and rebuilt everything, from
+// scratch, on every single update.
+function sendMessageToStreamlitClient(type, data) {
+  window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, data), "*");
+}
+const Streamlit = {
+  RENDER_EVENT: "streamlit:render",
+  setComponentReady: function () { sendMessageToStreamlitClient("streamlit:componentReady", {apiVersion: 1}); },
+  setFrameHeight: function (height) {
+    sendMessageToStreamlitClient("streamlit:setFrameHeight", {height: height === undefined ? document.body.scrollHeight : height});
+  },
+  setComponentValue: function (value) { sendMessageToStreamlitClient("streamlit:setComponentValue", {value}); },
+  events: {
+    addEventListener: function (type, callback) {
+      window.addEventListener("message", function (event) {
+        if (event.data.type === type) { event.detail = event.data; callback(event); }
+      });
+    }
+  }
+};
+
+// ---- graph state, persists across render events ----
+const INK_NAVY = "#06060A", INK_SOFT = "#B9B2CC", TOOLTIP_BG = "#151020";
+const HOVER_RADIUS = 16; // px — roughly one cursor-width in any direction, not the whole local cluster
+const HOVER_MAX = 3;
+const TOOLTIP_W = 220;
+const LEADER_STROKE_WIDTH = 1; // graph edges are set a bit thicker than this, so real structure reads as more prominent than a hover callout
+
+let initialized = false;
+let root, svg, zoomLayer, linkLayer, nodeLayer, sim;
+let currentTransform = null; // set once d3.zoom is wired up in init(); screen <-> world coordinate mapping
+let nodeSel = null, linkSel = null;
+let allNodes = [], allLinks = [];
+// Nodes wait here, undrawn, until an edge shows up that connects them to
+// something — a node that never gets one (irrelevant to every dimension)
+// just stays here forever: excluded from the DOM and the simulation
+// entirely, not merely hidden, since it has nothing to show anyway.
+let pendingNodes = new Map();
+let nodeById = new Map(), linkKeys = new Set();
+let parentOf = new Map(); // child id -> parent id, within its own dimension — the tree is single-parent today
+let aliveSet = null; // recomputed by recomputeAliveSet(); null means "no weight filter active, everyone passes"
+let dimColorMap = {}, sourceColor = "#5B6494";
+let dimCenter = {}, cx = 0, cy = 0, width = 0, height = 480;
+let currentActiveDim = null;
+let highlightedIds = new Set(); // hover spotlight: hovered node(s) + their first-order neighbors in the active dimension
+let weightThreshold = 0; // weight slider — a node below this, within the active dimension, is fully hidden
+const HUB_EDGE_WEIGHT = 0.5;
+let quad = null;
+let tooltipEls = [], leaderSel = null;
+let pendingMouse = null, hoverRafScheduled = false;
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function seed(id, mult) {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * mult + id.charCodeAt(i)) >>> 0;
+  return (h % 1000) / 1000;
+}
+
+function hexToRgb(hex) {
+  const v = hex.replace("#", "");
+  const full = v.length === 3 ? v.split("").map(c => c + c).join("") : v;
+  const n = parseInt(full, 16);
+  return {r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255};
+}
+
+// A plain desaturated fill/stroke color instead of an SVG grayscale filter
+// applied live to every non-active element — with ~1000 elements on
+// screen, per-element SVG filters (each one forcing its own offscreen
+// raster pass) were the single biggest source of lag in the finished view.
+// A plain color is just a paint, same cost as any other fill.
+function toGray(hex) {
+  const {r, g, b} = hexToRgb(hex);
+  const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+  const mix = c => Math.round(c * 0.06 + gray * 0.94);
+  return `rgb(${mix(r)},${mix(g)},${mix(b)})`;
+}
+
+// Color has exactly two jobs: hue says which dimension, dull-vs-vivid
+// (via colorFor/toGray below) says hovered-or-not. A third job — a
+// level→lightness ramp for collapse depth — used to live here too, but
+// it fought with the hover dulling (both moved the same lightness axis,
+// so "is this dim because it's not hovered, or because it's an early
+// level?" had no answer). Depth now shows as a stroke ring on terminal
+// nodes instead (see updateSelections) — a node's own color is always
+// just its dimension's true hue.
+function baseColorFor(d) {
+  if (d.kind === "source_sentence" || !d.dimension) return sourceColor;
+  return dimColorMap[d.dimension] || "#888";
+}
+
+// weightByDim (see app.py's _attach_node_weights) only scores source
+// sentences — their own single-hop relevance judgment, nothing
+// compounded through the tree (see compute_node_weights). A
+// composite/terminal's visibility is derived bottom-up instead: alive
+// if any sentence beneath it passes. Recomputed here in one linear pass
+// over the sentences whenever the threshold or active dimension changes
+// (called from applyHighlight, which already runs on every relevant
+// event) rather than a per-node recursive check in the render loop —
+// cheap, and the early-exit on an already-marked ancestor means a
+// shared ancestor's cost is paid once, not once per descendant.
+function recomputeAliveSet() {
+  if (!currentActiveDim || weightThreshold <= 0) { aliveSet = null; return; }
+  const alive = new Set();
+  allNodes.forEach(n => {
+    if (n.kind !== "source_sentence") return;
+    const w = (n.weightByDim && n.weightByDim[currentActiveDim]) || 0;
+    if (w < weightThreshold) return;
+    let id = n.id;
+    while (id && !alive.has(id)) {
+      alive.add(id);
+      id = parentOf.get(id + "|" + currentActiveDim);
+    }
+  });
+  aliveSet = alive;
+}
+
+function passesWeightFilter(d) {
+  if (!aliveSet) return true;
+  if (d.kind) return d.kind === "hub" || aliveSet.has(d.id);
+  // A link (no `.kind`) — hidden if either endpoint is (hub endpoints
+  // are always alive, same exemption as above).
+  const childAlive = aliveSet.has(d.child) || nodeById.get(d.child)?.kind === "hub";
+  const parentAlive = aliveSet.has(d.parent) || nodeById.get(d.parent)?.kind === "hub";
+  return childAlive && parentAlive;
+}
+
+// A node's own weight (see passesWeightFilter) is an absolute cut, not
+// something hover overrides — check it before any highlight logic at all.
+// Everything outside the selected dimension drops to near-invisible —
+// not just dimmed, out of the way — while the selected dimension's own
+// nodes stay dull, deliberately far below "in focus," a quiet skeleton
+// rather than the main event. `isHighlighted` (hovered node, or its
+// first-order neighbor within this dimension — see
+// updateHighlightFromHover) is what promotes something out of that
+// skeleton to fully visible.
+function opacityFor(d, activeDim, isHighlighted) {
+  if (!passesWeightFilter(d)) return 0;
+  if (!activeDim) return d.dimension ? 0.85 : 0.9;
+  if (isHighlighted) return 1;
+  // Not literally zero — the rest of the graph still needs to read as a
+  // dimmed mass/texture surrounding the selected dimension, not a void.
+  return d.dimension === activeDim ? 0.32 : 0.07;
+}
+
+function colorFor(d, activeDim, isHighlighted) {
+  const base = baseColorFor(d);
+  if (!activeDim || d.dimension !== activeDim) return base;
+  return isHighlighted ? base : toGray(base);
+}
+
+// Glow now marks the hover spotlight itself, not "belongs to this
+// dimension" — with everything else already dulled/hidden, a glow on
+// every composite in the active dimension would fight the point of
+// dulling them. Reserved for composites/hub, not the (far more numerous)
+// source-sentence circles, same reasoning as before: an SVG blur filter
+// is per-element expensive, and only ever a handful of nodes are
+// highlighted at once, so this stays cheap either way.
+function glowFor(d, activeDim, isHighlighted) {
+  if (!activeDim || !isHighlighted || d.kind === "source_sentence" || d.dimension !== activeDim) return "none";
+  return "url(#glow)";
+}
+
+function applyHighlight(activeDim, highlightedIds) {
+  if (!nodeSel || !linkSel) return;
+  recomputeAliveSet();
+  nodeSel.style("opacity", d => opacityFor(d, activeDim, highlightedIds.has(d.id)))
+    .attr("fill", d => colorFor(d, activeDim, highlightedIds.has(d.id)))
+    .style("filter", d => glowFor(d, activeDim, highlightedIds.has(d.id)));
+  linkSel.style("opacity", d => opacityFor(d, activeDim, highlightedIds.has(d.child) && highlightedIds.has(d.parent)))
+    .attr("stroke", d => colorFor(d, activeDim, highlightedIds.has(d.child) && highlightedIds.has(d.parent)));
+}
+
+// Which nodes are "lit up" right now: whatever's within the hover radius,
+// plus each of those nodes' first-order neighbors within the active
+// dimension (the only edges visible anyway once a dimension is selected).
+// With no dimension selected, hovering doesn't change anything — this
+// spotlight behavior only exists to help trace one dimension's structure.
+function updateHighlightFromHover(found) {
+  const ids = new Set();
+  if (currentActiveDim) {
+    found.forEach(({n}) => {
+      ids.add(n.id);
+      allLinks.forEach(e => {
+        if (e.dimension !== currentActiveDim) return;
+        if (e.child === n.id) ids.add(e.parent);
+        else if (e.parent === n.id) ids.add(e.child);
+      });
+    });
+  }
+  highlightedIds = ids;
+  applyHighlight(currentActiveDim, highlightedIds);
+}
+
+function rebuildQuadtree() {
+  quad = d3.quadtree().x(d => d.x).y(d => d.y)
+    .addAll(allNodes.filter(d => d.text && passesWeightFilter(d)));
+}
+
+function ticked() {
+  // Nothing rendered yet — e.g. the very first render event arrived
+  // before any node had a resolvable edge (nothing promoted out of
+  // pendingNodes), so updateSelections() was never called.
+  if (!linkSel || !nodeSel) return;
+
+  // Nothing else bounds the layout to the canvas — with hundreds of
+  // same-signed charge nodes and only a weak anchor on source sentences,
+  // cumulative repulsion can otherwise push stray nodes off-screen entirely.
+  const margin = 6;
+  allNodes.forEach(d => {
+    d.x = Math.max(margin, Math.min(width - margin, d.x));
+    d.y = Math.max(margin, Math.min(height - margin, d.y));
+  });
+  linkSel.attr("x1", d => d.source.x).attr("y1", d => d.source.y).attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+  nodeSel.attr("cx", d => d.x).attr("cy", d => d.y);
+  rebuildQuadtree();
+}
+
+function drag(simulation) {
+  function dragstarted(event, d) {
+    if (!event.active) simulation.alphaTarget(0.3).restart();
+    d.fx = d.x; d.fy = d.y;
+  }
+  function dragged(event, d) { d.fx = event.x; d.fy = event.y; }
+  function dragended(event, d) {
+    if (!event.active) simulation.alphaTarget(0);
+    d.fx = null; d.fy = null; // released back to the force model, not pinned forever
+  }
+  // clickDistance allows a few pixels of jitter before it counts as a
+  // real drag — d3-drag's default (0) suppresses the `click` event on
+  // ANY movement at all, which would make a source-sentence node
+  // effectively unclickable (see onNodeClick).
+  return d3.drag().clickDistance(4).on("start", dragstarted).on("drag", dragged).on("end", dragended);
+}
+
+// Jump-to-transcript: only source sentences have a real transcript
+// span (start/end) to jump to — composites/terminals/hub are synthesized
+// text, nothing to scroll to. Streamlit reruns the owning fragment on a
+// component value change, same as any widget, without remounting this
+// iframe (see the module docstring).
+function onNodeClick(event, d) {
+  if (d.kind !== "source_sentence" || d.start == null || d.end == null) return;
+  Streamlit.setComponentValue({sentenceId: d.id, start: d.start, end: d.end});
+}
+
+function updateSelections() {
+  linkSel = linkLayer.selectAll("line")
+    .data(allLinks, d => d.child + "|" + d.parent + "|" + d.dimension)
+    .join(enter => enter.append("line")
+      .attr("stroke", d => baseColorFor(d))
+      .attr("stroke-width", d => LEADER_STROKE_WIDTH + 0.4 + d.weight * 2) // ever so slightly thicker than a leader line at every weight
+    );
+
+  nodeSel = nodeLayer.selectAll("circle")
+    .data(allNodes, d => d.id)
+    .join(enter => {
+      const entered = enter.append("circle")
+        .attr("cx", d => d.x).attr("cy", d => d.y)
+        .attr("r", 0)
+        .attr("fill", d => baseColorFor(d))
+        // Depth marker: a terminal node — an actual final conclusion,
+        // not a step along the way — gets a ring. Replaces the old
+        // level-color ramp (see baseColorFor) as how "is this done
+        // collapsing yet?" shows up.
+        .attr("stroke", d => d.terminal ? "#EDEAF6" : "none")
+        .attr("stroke-width", d => d.terminal ? 1.5 : 0)
+        .attr("stroke-opacity", d => d.terminal ? 0.55 : 0)
+        .style("cursor", d => d.kind === "source_sentence" ? "pointer" : "grab")
+        .on("click", onNodeClick)
+        .call(drag(sim));
+      if (reduceMotion) {
+        entered.attr("r", d => d.r);
+      } else {
+        entered.transition().duration(700).ease(d3.easeElasticOut.amplitude(1).period(0.5)).attr("r", d => d.r);
+      }
+      return entered;
+    });
+
+  applyHighlight(currentActiveDim, highlightedIds);
+}
+
+function makeSimNode(raw) {
+  const anchor = raw.dimension ? dimCenter[raw.dimension] : {x: cx, y: cy};
+  const node = Object.assign({}, raw, {
+    seedX: anchor.x + (seed(raw.id, 31) - 0.5) * 70,
+    seedY: anchor.y + (seed(raw.id, 17) - 0.5) * 70,
+    r: raw.kind === "source_sentence" ? 3.5 : (5 + raw.level * 2.5),
+  });
+  node.x = node.seedX; node.y = node.seedY;
+  return node;
+}
+
+// One synthetic hub per dimension, pinned at that dimension's ring point —
+// no LLM involved, it's purely structural: every terminal node for a
+// dimension gets an edge to its hub (see linkTerminalToHub), so a
+// dimension's final conclusions are pulled visibly together instead of
+// only sharing a soft anchor force with nothing actually connecting them.
+function createDimensionHubs() {
+  Object.keys(dimColorMap).forEach(dim => {
+    const center = dimCenter[dim];
+    const hub = {
+      id: "hub-" + dim, level: 0, kind: "hub", dimension: dim, terminal: false,
+      text: dim.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase()),
+      x: center.x, y: center.y, seedX: center.x, seedY: center.y,
+      fx: center.x, fy: center.y,
+      r: 9,
+    };
+    nodeById.set(hub.id, hub);
+    allNodes.push(hub);
+  });
+}
+
+function linkTerminalToHub(node) {
+  if (!node.terminal || !node.dimension) return false;
+  const hubId = "hub-" + node.dimension;
+  if (!nodeById.has(hubId)) return false;
+  const key = node.id + "|" + hubId + "|" + node.dimension;
+  if (linkKeys.has(key)) return false;
+  linkKeys.add(key);
+  allLinks.push({child: node.id, parent: hubId, dimension: node.dimension, weight: HUB_EDGE_WEIGHT, source: node.id, target: hubId});
+  return true;
+}
+
+function mergeData(nodes, edges) {
+  let added = false;
+
+  nodes.forEach(n => {
+    // weightByDim is computed in Python only once the run completes (it
+    // needs the full sentence set to normalize against), well after most
+    // nodes have already streamed in and been promoted here — so a node
+    // already known still needs this one field patched in when it shows
+    // up, not silently ignored the way a truly-redundant repeat payload
+    // should be.
+    if (nodeById.has(n.id)) {
+      const existing = nodeById.get(n.id);
+      if (n.weightByDim && !existing.weightByDim) existing.weightByDim = n.weightByDim;
+      return;
+    }
+    if (pendingNodes.has(n.id)) {
+      const existing = pendingNodes.get(n.id);
+      if (n.weightByDim && !existing.weightByDim) existing.weightByDim = n.weightByDim;
+      return;
+    }
+    pendingNodes.set(n.id, n);
+  });
+
+  edges.forEach(e => {
+    const key = e.child + "|" + e.parent + "|" + e.dimension;
+    if (linkKeys.has(key)) return;
+    const childKnown = nodeById.has(e.child) || pendingNodes.has(e.child);
+    const parentKnown = nodeById.has(e.parent) || pendingNodes.has(e.parent);
+    if (!childKnown || !parentKnown) return; // one side hasn't streamed in yet; retried on a later merge
+
+    // Keyed by child+dimension, not just child — a source sentence can have
+    // a different parent in each dimension it's relevant to (a composite
+    // only ever has one, since its own edges are all within its own
+    // dimension, so this key scheme is consistent at every hop up).
+    const parentKey = e.child + "|" + e.dimension;
+    if (!parentOf.has(parentKey)) parentOf.set(parentKey, e.parent);
+
+    [e.child, e.parent].forEach(id => {
+      if (!pendingNodes.has(id)) return;
+      const simNode = makeSimNode(pendingNodes.get(id));
+      pendingNodes.delete(id);
+      nodeById.set(id, simNode);
+      allNodes.push(simNode);
+      linkTerminalToHub(simNode);
+    });
+
+    linkKeys.add(key);
+    allLinks.push(Object.assign({}, e, {source: e.child, target: e.parent}));
+    added = true;
+  });
+
+  if (!added) return;
+
+  sim.nodes(allNodes);
+  sim.force("link").links(allLinks);
+  updateSelections();
+  if (initialized) {
+    // Nudge the simulation awake just enough to place the new arrivals —
+    // everything already at equilibrium barely moves, since the forces
+    // acting on it haven't changed, only new nodes/edges were added to them.
+    sim.alpha(Math.max(sim.alpha(), 0.35)).restart();
+  }
+}
+
+// Plain range input, not a Streamlit widget — a Streamlit slider reruns
+// the whole script on release (or worse, mid-drag), which is exactly the
+// redraw this needs to avoid. `input` fires continuously as the user
+// drags; each tick just re-runs the existing applyHighlight() restyle
+// (opacity/color only, see passesWeightFilter/opacityFor) — no simulation
+// or DOM rebuild, so it stays smooth regardless of node count.
+function createWeightSlider() {
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "position:absolute;left:14px;bottom:14px;display:flex;align-items:center;gap:8px;" +
+    "background:rgba(15,13,22,0.85);padding:6px 12px;border-radius:999px;border:1px solid #211C2E;" +
+    "font:12px 'Libre Baskerville',Georgia,serif;color:#B9B2CC;z-index:5;";
+  const label = document.createElement("span");
+  label.textContent = "weight ≥";
+  const input = document.createElement("input");
+  input.type = "range"; input.min = "0"; input.max = "1"; input.step = "0.01"; input.value = "0";
+  input.style.width = "120px";
+  const value = document.createElement("span");
+  value.textContent = "0.00";
+  value.style.cssText = "min-width:2.6em;text-align:right;";
+  input.addEventListener("input", () => {
+    weightThreshold = parseFloat(input.value);
+    value.textContent = weightThreshold.toFixed(2);
+    applyHighlight(currentActiveDim, highlightedIds);
+  });
+  wrap.appendChild(label); wrap.appendChild(input); wrap.appendChild(value);
+  root.appendChild(wrap);
+}
+
+function ensureTooltips() {
+  if (tooltipEls.length) return;
+  for (let i = 0; i < HOVER_MAX; i++) {
+    const el = document.createElement("div");
+    el.className = "node-tooltip";
+    el.style.width = TOOLTIP_W + "px";
+    el.style.background = TOOLTIP_BG;
+    el.style.color = INK_SOFT;
+    root.appendChild(el);
+    tooltipEls.push(el);
+  }
+  leaderSel = svg.append("g").selectAll("line")
+    .data(d3.range(HOVER_MAX))
+    .join("line")
+    .attr("stroke", INK_SOFT)
+    .attr("stroke-width", LEADER_STROKE_WIDTH)
+    .attr("opacity", 0);
+}
+
+function hideTooltips() {
+  tooltipEls.forEach(el => { el.style.opacity = "0"; el.style.visibility = "hidden"; });
+  if (leaderSel) leaderSel.attr("opacity", 0);
+}
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// Nearest point on a box's boundary to (px, py) — where a leader line
+// from the node should actually terminate, not just the box's corner.
+function closestPointOnRect(px, py, rect) {
+  return [
+    Math.max(rect.x, Math.min(px, rect.x + rect.w)),
+    Math.max(rect.y, Math.min(py, rect.y + rect.h)),
+  ];
+}
+
+// One box per nearby node (not one combined box) — each anchored next to
+// its own node, nudged down if it would overlap a box already placed, and
+// connected back to that node with a thin leader line so it's unambiguous
+// which box belongs to which node once a couple of them stack up.
+function renderTooltipBoxes(found) {
+  if (!found.length) { hideTooltips(); return; }
+  const placed = [];
+  found.forEach((item, i) => {
+    // Boxes/leaders live in screen space (outside the zoomed group), so
+    // they anchor to where the node currently renders on screen, not its
+    // raw (unzoomed) world position.
+    const [nx, ny] = currentTransform.apply([item.n.x, item.n.y]);
+    const el = tooltipEls[i];
+    el.textContent = item.n.text;
+    el.style.visibility = "hidden";
+    el.style.opacity = "1";
+    const h = el.offsetHeight || 32;
+    let x = Math.min(nx + 12, width - TOOLTIP_W - 8);
+    let y = ny - h - 10;
+    if (y < 0) y = ny + 12; // flip below if it would clip above the canvas
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const rect = {x, y, w: TOOLTIP_W, h};
+      if (!placed.some(p => rectsOverlap(rect, p))) break;
+      y += h + 6;
+    }
+    el.style.left = x + "px";
+    el.style.top = y + "px";
+    el.style.visibility = "visible";
+    const rect = {x, y, w: TOOLTIP_W, h};
+    placed.push(rect);
+
+    const [lx, ly] = closestPointOnRect(nx, ny, rect);
+    const leader = leaderSel.nodes()[i];
+    d3.select(leader)
+      .attr("x1", nx).attr("y1", ny)
+      .attr("x2", lx).attr("y2", ly)
+      .attr("opacity", 0.7);
+  });
+  for (let i = found.length; i < tooltipEls.length; i++) {
+    tooltipEls[i].style.opacity = "0";
+    tooltipEls[i].style.visibility = "hidden";
+    d3.select(leaderSel.nodes()[i]).attr("opacity", 0);
+  }
+}
+
+function findNearby(mx, my, radius, k) {
+  const results = [];
+  if (!quad) return results;
+  quad.visit((node, x0, y0, x1, y1) => {
+    if (!node.length) {
+      let p = node;
+      do {
+        const d = p.data;
+        const dist = Math.hypot(d.x - mx, d.y - my);
+        if (dist <= radius) results.push({n: d, d: dist});
+      } while ((p = p.next));
+      return false;
+    }
+    return x0 > mx + radius || x1 < mx - radius || y0 > my + radius || y1 < my - radius;
+  });
+  results.sort((a, b) => a.d - b.d);
+  return results.slice(0, k);
+}
+
+function processHover() {
+  hoverRafScheduled = false;
+  if (!pendingMouse) return;
+  // pendingMouse is in screen space; findNearby works in the graph's own
+  // (unzoomed) world space, same as node.x/node.y — so both the point and
+  // the search radius need to go through the inverse zoom transform. The
+  // radius is divided by the zoom scale so it stays "one cursor-width" on
+  // screen at any zoom level, rather than shrinking/growing with content.
+  const [mx, my] = currentTransform.invert(pendingMouse);
+  const found = findNearby(mx, my, HOVER_RADIUS / currentTransform.k, HOVER_MAX);
+  renderTooltipBoxes(found);
+  updateHighlightFromHover(found);
+}
+
+function onMouseMove(event) {
+  pendingMouse = d3.pointer(event);
+  if (hoverRafScheduled) return;
+  hoverRafScheduled = true;
+  requestAnimationFrame(processHover);
+}
+
+function onMouseLeave() {
+  pendingMouse = null;
+  hideTooltips();
+  if (highlightedIds.size) updateHighlightFromHover([]);
+}
+
+function init(args) {
+  dimColorMap = args.dimColors;
+  sourceColor = args.sourceColor;
+  height = args.height || 480;
+
+  root = document.getElementById("graph-root");
+  root.style.height = height + "px";
+  root.style.background = INK_NAVY;
+  width = root.clientWidth;
+  cx = width / 2; cy = height / 2;
+
+  const ringR = Math.min(width, height) * 0.32;
+  const dimNames = Object.keys(dimColorMap);
+  dimNames.forEach((d, i) => {
+    const angle = (i / dimNames.length) * 2 * Math.PI - Math.PI / 2;
+    dimCenter[d] = {x: cx + ringR * Math.cos(angle), y: cy + ringR * Math.sin(angle)};
+  });
+
+  svg = d3.select(root).append("svg").attr("width", width).attr("height", height);
+
+  const defs = svg.append("defs");
+  const glow = defs.append("filter").attr("id", "glow").attr("x", "-60%").attr("y", "-60%").attr("width", "220%").attr("height", "220%");
+  glow.append("feGaussianBlur").attr("stdDeviation", 2.2).attr("result", "blur");
+  const glowMerge = glow.append("feMerge");
+  glowMerge.append("feMergeNode").attr("in", "blur");
+  glowMerge.append("feMergeNode").attr("in", "SourceGraphic");
+
+  // Nodes/edges live inside this group so d3.zoom can pan/scale them as
+  // one unit — leader lines and the tooltip boxes stay outside it, in
+  // plain screen space, since they're anchored to where a node currently
+  // renders on screen rather than to the graph's own (unzoomed) coordinates.
+  zoomLayer = svg.append("g");
+  linkLayer = zoomLayer.append("g");
+  nodeLayer = zoomLayer.append("g");
+  ensureTooltips();
+  createWeightSlider();
+
+  currentTransform = d3.zoomIdentity;
+  const zoom = d3.zoom()
+    .scaleExtent([0.3, 6])
+    .on("zoom", event => {
+      currentTransform = event.transform;
+      zoomLayer.attr("transform", currentTransform);
+    });
+  svg.call(zoom);
+
+  createDimensionHubs();
+
+  sim = d3.forceSimulation([])
+    .force("link", d3.forceLink([]).id(d => d.id).distance(22).strength(0.9))
+    .force("charge", d3.forceManyBody().strength(d => d.kind === "source_sentence" ? -6 : -35))
+    .force("collision", d3.forceCollide(d => d.r + 2))
+    .force("anchorX", d3.forceX(d => d.dimension ? dimCenter[d.dimension].x : cx).strength(d => d.dimension ? 0.12 : 0.02))
+    .force("anchorY", d3.forceY(d => d.dimension ? dimCenter[d.dimension].y : cy).strength(d => d.dimension ? 0.12 : 0.02))
+    .stop();
+
+  mergeData(args.nodes, args.edges);
+
+  // Settle headlessly on first load only — no visible frame shows the
+  // simulation mid-flight. After this, the sim stays inert (alphaTarget 0)
+  // until a drag or newly streamed data wakes it again.
+  for (let i = 0; i < 220; i++) sim.tick();
+  sim.on("tick", ticked);
+  ticked();
+
+  svg.on("mousemove", onMouseMove).on("mouseleave", onMouseLeave);
+}
+
+function onRender(event) {
+  const args = event.detail.args;
+  // A stale hover spotlight from the previous dimension has no meaning
+  // once the selection changes — clear it rather than let it leak through.
+  if (args.activeDim !== currentActiveDim) highlightedIds = new Set();
+  currentActiveDim = args.activeDim;
+  if (!initialized) {
+    init(args);
+    initialized = true;
+  } else {
+    mergeData(args.nodes, args.edges);
+  }
+  applyHighlight(currentActiveDim, highlightedIds);
+  Streamlit.setFrameHeight(height + 4);
+}
+
+Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+Streamlit.setComponentReady();
+Streamlit.setFrameHeight(480);
+</script>
+</body>
+</html>

@@ -31,6 +31,15 @@ For each of the six dimensions below, do two things:
    0-scored inputs) — this becomes one input to the next collapse
    round, or, if `is_terminal` is true, the final grounded conclusion
    for this theme. Do not pad, hedge, or add a second sentence.
+   The sentence's GRAMMATICAL SUBJECT must be the claim, number, or
+   concrete detail itself — never "Management", "Executives", "The
+   company", "The discussion", or any other narrator standing between
+   the reader and the content, no matter what verb follows it. Wrong:
+   "Management reaffirmed full-year guidance of 8% growth." Right:
+   "Full-year guidance reaffirmed at 8% growth." If you notice every
+   composite in this batch starting with the same subject, that's the
+   failure mode this is asking you to avoid — vary the sentence shape
+   to match what's actually distinctive about each one.
 
 If `is_terminal` is true, also classify the dimension's overall
 reading for this group as an integer 1-5: 1=strong_negative,

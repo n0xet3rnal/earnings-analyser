@@ -1,6 +1,6 @@
 import pytest
 
-from earnings_analyser.analysis.attribution import compute_attribution
+from earnings_analyser.analysis.attribution import compute_attribution, compute_node_weights
 from earnings_analyser.persistence.graph_store import Edge, GraphStore, Node
 
 
@@ -90,3 +90,60 @@ def test_multi_parent_convergence_sums_across_paths(tmp_path):
 
         expected_s0 = (0.5 * 0.5) + (0.4 * 0.5)  # sum across both converging paths
         assert attribution["s0"] == pytest.approx(expected_s0)
+
+
+def test_node_weights_score_only_source_sentences(tmp_path):
+    # s0,s1 -> c0 (level 1) -> t0 (level 2, terminal). Weight is each
+    # sentence's own edge to c0, not compounded through c0 -> t0 at all —
+    # composites/terminals get no entry from this function.
+    with GraphStore(tmp_path / "graph.sqlite") as store:
+        store.add_nodes(
+            [
+                Node(node_id="s0", level=0, kind="source_sentence", text="a", start=0, end=1),
+                Node(node_id="s1", level=0, kind="source_sentence", text="b", start=1, end=2),
+                Node(node_id="c0", level=1, kind="composite", text="c0", dimension="uncertainty"),
+                Node(node_id="t0", level=2, kind="composite", text="t0", dimension="uncertainty",
+                     label="neutral", terminal=True),
+            ]
+        )
+        store.add_edges(
+            [
+                Edge(child="s0", parent="c0", dimension="uncertainty", weight=0.6),
+                Edge(child="s1", parent="c0", dimension="uncertainty", weight=0.4),
+                Edge(child="c0", parent="t0", dimension="uncertainty", weight=0.1),  # deliberately low — must not dilute s0/s1
+            ]
+        )
+
+        weights = compute_node_weights(store, "uncertainty")
+
+        assert set(weights) == {"s0", "s1"}  # no c0, no t0
+        assert weights["s0"] == pytest.approx(1.0)  # 0.6 is the peak of the dimension's sentences
+        assert weights["s1"] == pytest.approx(0.4 / 0.6)
+
+
+def test_node_weights_normalize_by_the_dimension_peak(tmp_path):
+    # Two independent terminals in the same dimension; s1 should end up
+    # weaker than s0 once normalized, since s0's own edge weight is higher.
+    with GraphStore(tmp_path / "graph.sqlite") as store:
+        store.add_nodes(
+            [
+                Node(node_id="s0", level=0, kind="source_sentence", text="a", start=0, end=1),
+                Node(node_id="s1", level=0, kind="source_sentence", text="b", start=1, end=2),
+                Node(node_id="t0", level=1, kind="composite", text="t0", dimension="jargon",
+                     label="neutral", terminal=True),
+                Node(node_id="t1", level=1, kind="composite", text="t1", dimension="jargon",
+                     label="neutral", terminal=True),
+            ]
+        )
+        store.add_edges(
+            [
+                Edge(child="s0", parent="t0", dimension="jargon", weight=1.0),
+                Edge(child="s1", parent="t1", dimension="jargon", weight=0.5),
+            ]
+        )
+
+        weights = compute_node_weights(store, "jargon")
+
+        assert set(weights) == {"s0", "s1"}
+        assert weights["s0"] == pytest.approx(1.0)  # peak of the whole dimension
+        assert weights["s1"] == pytest.approx(0.5)  # half of the peak

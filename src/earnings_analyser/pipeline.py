@@ -9,6 +9,8 @@ compact-prompt implementations (bypasses DSPy's default adapter — measured
 configured `dspy.LM` (local Ollama or a cloud provider).
 """
 
+from typing import Callable
+
 import dspy
 
 from .modules.collapse_step import (
@@ -31,6 +33,7 @@ def run_pipeline(
     max_workers: int = DEFAULT_MAX_WORKERS,
     requests_per_minute: int | None = None,
     lm: dspy.LM | None = None,
+    on_progress: Callable[[], None] | None = None,
 ) -> None:
     collapse(
         store,
@@ -43,4 +46,5 @@ def run_pipeline(
         target=target,
         max_workers=max_workers,
         requests_per_minute=requests_per_minute,
+        on_progress=on_progress,
     )

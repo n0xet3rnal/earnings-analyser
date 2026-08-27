@@ -3,7 +3,7 @@
 WAL mode specifically because a live graph viewer is expected to read the
 store while the pipeline is still writing to it — this is exactly the
 one-writer/concurrent-readers pattern WAL mode exists for (see
-`implementation-plan.md` §5). Resumability comes from `run_status`: a
+`docs/implementation-plan.md` §5). Resumability comes from `run_status`: a
 restarted pipeline reads `last_complete_level()` and skips straight to the
 next level instead of recomputing finished work.
 """

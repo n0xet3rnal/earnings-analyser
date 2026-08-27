@@ -7,3 +7,6 @@ __pycache__/
 .pytest_cache/
 dspy_cache/
 src/data
+
+# Internal build/design notes — kept locally for reference, not published.
+docs/implementation-plan.md

@@ -1,6 +1,6 @@
 """Compact-prompt predictor for the collapse calls, bypassing DSPy's
 default adapter (measured ~43% pure scaffolding, not model content —
-see implementation-plan.md). Backend-agnostic: takes any `dspy.LM`
+see docs/implementation-plan.md). Backend-agnostic: takes any `dspy.LM`
 instance (Ollama or a cloud provider like Gemini) and calls it directly,
 never through `dspy.Predict`/Signature/Adapter.
 """
@@ -40,11 +40,22 @@ def _call_lm(lm: dspy.LM, prompt: str) -> str:
     return response[0] if isinstance(response, list) else response
 
 
+def _looks_like_weights(part: str) -> bool:
+    tokens = [t.strip() for t in part.split(",") if t.strip()]
+    return bool(tokens) and all(t.lstrip("-").isdigit() for t in tokens)
+
+
 def _parse_compact(text: str) -> dict[str, dict[str, Any]]:
     lines = [l for l in text.strip().splitlines() if l.strip()]
     out: dict[str, dict[str, Any]] = {}
     for dim, line in zip(DIMENSIONS, lines):
-        parts = line.split("|")
+        raw_parts = line.split("|")
+        # The model occasionally prepends a spurious field (e.g. the
+        # dimension name) before the weights, shifting weights_raw/summary/
+        # label_raw off by one — drop any leading junk field(s) that don't
+        # parse as the weights list, rather than trusting position blindly.
+        start = next((i for i, p in enumerate(raw_parts) if _looks_like_weights(p)), 0)
+        parts = raw_parts[start:]
         weights_raw, summary, label_raw = (parts + ["", "", ""])[:3]
         try:
             weights = [int(x) for x in weights_raw.split(",") if x.strip()]

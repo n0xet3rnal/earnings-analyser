@@ -10,7 +10,7 @@ Base windows can overlap by N sentences (each window's last N sentences
 also open the next window) — this was the only source of multi-parent
 structure in the collapse graph (a leaf sentence at a boundary weighted
 by two separate calls, cited by two composites). The pipeline's default
-is now 0 overlap: call-count reduction (implementation-plan.md, "Cut
+is now 0 overlap: call-count reduction (docs/implementation-plan.md, "Cut
 collapse-pipeline wall-clock time") took priority over that boundary
 guarantee, so the live collapse graph is currently a strict tree
 end-to-end, not a DAG. `overlap` stays a supported parameter here — set

@@ -1,4 +1,4 @@
-"""One level of the recursive weighted collapse (implementation-plan.md §2).
+"""One level of the recursive weighted collapse (docs/implementation-plan.md §2).
 
 `collapse()` is the whole orchestration: sentence-split the transcript,
 run the base (window) level, then keep collapsing per-dimension composite
@@ -33,8 +33,8 @@ import itertools
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Protocol
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Protocol
 
 from ..data.sentence_split import Window, base_windows, split_sentences
 from ..persistence.graph_store import Edge, GraphStore, Node
@@ -113,14 +113,25 @@ def _predict_with_retry(predictor: CollapsePredictor, kwargs: dict[str, Any], ra
 
 
 def _run_concurrently(predictor: CollapsePredictor, calls: list[dict[str, Any]], max_workers: int,
-                       rate_limiter: RateLimiter):
+                       rate_limiter: RateLimiter, on_progress: Callable[[], None] | None = None):
     """Dispatch one `_predict_with_retry` call per entry in `calls`
     through a thread pool — I/O-bound waiting on the backend's HTTP
     response, not CPU-bound, so threads (not processes) are the right
-    stdlib tool here. Returns results in the same order as `calls`."""
+    stdlib tool here. Returns results in the same order as `calls`.
+
+    Collected via `as_completed` (real finish order) rather than indexed
+    `f.result()` (submission order) specifically so `on_progress` — the
+    progress-bar callback — reports as calls actually land, not in bursts
+    gated by whichever call happens to be first in the list."""
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(_predict_with_retry, predictor, kwargs, rate_limiter) for kwargs in calls]
-        return [f.result() for f in futures]
+        future_to_index = {pool.submit(_predict_with_retry, predictor, kwargs, rate_limiter): i
+                            for i, kwargs in enumerate(calls)}
+        results: list[Any] = [None] * len(calls)
+        for future in as_completed(future_to_index):
+            results[future_to_index[future]] = future.result()
+            if on_progress:
+                on_progress()
+        return results
 
 
 def _normalized_weights(raw: list, n_items: int) -> list[float]:
@@ -187,6 +198,7 @@ def run_base_level(
     target: int,
     rate_limiter: RateLimiter,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    on_progress: Callable[[], None] | None = None,
 ) -> tuple[int, int]:
     """Sentence-split, group into overlapping base windows, run one
     `DimensionCollapse` call per window (all six dimensions at once —
@@ -206,7 +218,7 @@ def run_base_level(
         {"group_items": _format_items([s.text for s in w.sentences]), "is_terminal": is_terminal}
         for w in windows
     ]
-    results = _run_concurrently(predictor, calls, max_workers, rate_limiter)
+    results = _run_concurrently(predictor, calls, max_workers, rate_limiter, on_progress)
 
     for window, result in zip(windows, results):
         child_ids = [f"s{s.index}" for s in window.sentences]
@@ -228,6 +240,7 @@ def run_collapse_round(
     target: int,
     rate_limiter: RateLimiter,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    on_progress: Callable[[], None] | None = None,
 ) -> int:
     """One more round: group the previous level's composites per
     dimension into batches of `branching_factor`. Batch `i` is the same
@@ -237,7 +250,7 @@ def run_collapse_round(
     (dimension, batch) — a 6x reduction in call count at this level.
     Strict partition — every composite belongs to exactly one group here,
     unlike the base level's overlapping windows (see
-    implementation-plan.md §2.3: composites are already synthesized,
+    docs/implementation-plan.md §2.3: composites are already synthesized,
     coherent text, not raw fragments that can be arbitrarily split)."""
     new_level = level + 1
 
@@ -258,7 +271,7 @@ def run_collapse_round(
         }
         for i in range(n_groups)
     ]
-    results = _run_concurrently(bundled_predictor, calls, max_workers, rate_limiter)
+    results = _run_concurrently(bundled_predictor, calls, max_workers, rate_limiter, on_progress)
 
     for group_index, result in enumerate(results):
         for dim in DIMENSIONS:
@@ -283,6 +296,7 @@ def collapse(
     target: int = DEFAULT_TARGET_TERMINAL_COUNT,
     max_workers: int = DEFAULT_MAX_WORKERS,
     requests_per_minute: int | None = None,
+    on_progress: Callable[[], None] | None = None,
 ) -> None:
     """Full orchestration: base level (`DimensionCollapse`), then
     collapse rounds (`DimensionCollapseBundled`) until each dimension is
@@ -292,18 +306,48 @@ def collapse(
 
     One `RateLimiter` is created here and shared across every level of this
     run — a per-minute quota is global to the whole run, not reset each
-    round, so the limiter can't be recreated per level either."""
+    round, so the limiter can't be recreated per level either. `on_progress`,
+    if given, is called once per completed LLM call across the whole run —
+    see `estimate_call_count` for the matching total, used to drive a
+    progress bar in the UI."""
     rate_limiter = RateLimiter(requests_per_minute)
     resume_from = store.last_complete_level()
 
     if resume_from is None:
         level, count = run_base_level(
-            store, predictor, transcript_text, window_size, window_overlap, target, rate_limiter, max_workers
+            store, predictor, transcript_text, window_size, window_overlap, target, rate_limiter, max_workers,
+            on_progress,
         )
     else:
         level = resume_from
         count = len([n for n in store.nodes_at_level(level, kind="composite") if n.dimension == DIMENSIONS[0]])
 
     while count > target:
-        count = run_collapse_round(store, bundled_predictor, level, branching_factor, target, rate_limiter, max_workers)
+        count = run_collapse_round(
+            store, bundled_predictor, level, branching_factor, target, rate_limiter, max_workers, on_progress
+        )
         level += 1
+
+
+def estimate_call_count(
+    transcript_text: str,
+    window_size: int = 8,
+    window_overlap: int = 0,
+    branching_factor: int = DEFAULT_BRANCHING_FACTOR,
+    target: int = DEFAULT_TARGET_TERMINAL_COUNT,
+) -> int:
+    """How many LLM calls a `collapse()` run against this transcript will
+    make in total, computed up front (pure arithmetic, no model calls) so
+    a progress bar has a real denominator from the first tick instead of
+    only learning it level by level. Mirrors `collapse()`'s own round
+    structure exactly — the base level's call count is one per window,
+    then each further round is one call per `branching_factor`-sized
+    group, same `while count > target` loop `collapse()` runs, just
+    without actually dispatching anything."""
+    windows = base_windows(split_sentences(transcript_text), size=window_size, overlap=window_overlap)
+    count = len(windows)
+    total = count
+    while count > target:
+        count = -(-count // branching_factor)  # ceil division, matches itertools.batched's group count
+        total += count
+    return total

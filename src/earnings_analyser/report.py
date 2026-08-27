@@ -1,5 +1,5 @@
 """Structured report the UI consumes: per dimension, the terminal
-conclusions produced by the collapse (implementation-plan.md §2.3), each
+conclusions produced by the collapse (docs/implementation-plan.md §2.3), each
 with its own label, narrative, and cited evidence.
 
 Evidence is always a source sentence resolved by id through the graph
