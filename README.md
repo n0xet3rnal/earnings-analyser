@@ -1,6 +1,6 @@
 # CallSense
 
-Analyzes earnings call transcripts across six linguistic dimensions drawn from academic research on analyst communication, and shows the reasoning as a live, explorable graph instead of a black-box score. Every conclusion cites specific, located sentences from the transcript. Nothing is asserted without a traceable, weighted path back to the source text.
+Analyzes earnings call transcripts across six linguistic dimensions drawn from academic research on analyst communication, and shows the reasoning as an explorable graph. Every conclusion cites specific, located sentences from the transcript. Nothing is asserted without a traceable, weighted path back to the source text.
 
 ![Analysis view: the evidence graph, dimension tabs, zoom control, and transcript jump](docs/screenshots/analysis.png)
 
@@ -40,7 +40,7 @@ Everything is written to a SQLite (WAL-mode) graph store as it's produced (`pers
 
 ### The graph UI
 
-The graph is a real bidirectional Streamlit component (`ui/graph_component.py`, `ui/graph_frontend/index.html`: plain D3 plus a hand-rolled Streamlit component protocol, no build tooling), not a redraw-on-every-poll `st.components.v1.html` blast. That distinction is what makes the rest of it possible:
+The graph is a real bidirectional Streamlit component (`ui/graph_component.py`, `ui/graph_frontend/index.html`: plain D3 plus a hand-rolled Streamlit component protocol, no build tooling), so it persists across reruns rather than getting torn down and redrawn on every poll like `st.components.v1.html` would. That's what makes the rest of it possible:
 
 - **Mounts once, fully formed.** Analysis itself runs behind a plain progress screen (see below); the graph component only mounts after the run completes, already holding every node and edge, so there's no half-built layout to reason about or jank to hide.
 - **Dimension focus is a pure restyle.** Selecting a dimension (vertical tabs, left of the theme cards) dims everything else to near-invisible and dulls the selected dimension's own resting color. Hovering a node lights it up along with its first-order neighbors in that dimension, tracing structure without ever touching the underlying simulation.
@@ -51,9 +51,9 @@ The graph is a real bidirectional Streamlit component (`ui/graph_component.py`, 
 
 ### Deterministic attribution for citations
 
-Every edge carries a real relevance weight from the model's own scoring. `analysis/attribution.py`'s `compute_attribution` chains those weights together across every round (a weighted breadth-first walk from each terminal down to its leaves) to compute exactly how much each sentence explains a given conclusion: a real, computable share, not just "cited or not." That's what powers the ranked evidence list under each theme card.
+Every edge carries a real relevance weight from the model's own scoring. `analysis/attribution.py`'s `compute_attribution` chains those weights together across every round (a weighted breadth-first walk from each terminal down to its leaves) to compute exactly how much each sentence explains a given conclusion, a real, computable share for each piece of evidence. That's what powers the ranked evidence list under each theme card.
 
-### Analysis screen: a progress log, not a half-built graph
+### Analysis screen: a progress log
 
 An earlier version streamed the graph live, mid-build, updating the force simulation every second as new levels landed. It looked good in a demo but was fragile in practice: node positions kept jumping as new evidence arrived, and there was nothing gained from watching it half-finished. The analysis screen now shows a plain progress bar and a growing log of what's completed ("Level 2 composed", and so on) until the run is done, then hands off to the fully-formed graph in one step. Once a run completes, its underlying SQLite graph store can be downloaded directly ("Save this run"), the same file the fixture-replay path below reads from.
 
