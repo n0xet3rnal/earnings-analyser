@@ -1,73 +1,117 @@
-# Earnings Call Analyzer
+# Earnings Call Analysis
 
-Analyzes earnings call transcripts across six linguistic dimensions drawn from academic research on analyst communication. Runs entirely locally against a small open-weight model via Ollama — no cloud API key required. Every conclusion cites specific, located sentences from the transcript; nothing is asserted without a traceable source.
+Analyzes earnings call transcripts across six linguistic dimensions drawn from academic research on analyst communication, and shows the reasoning as a live, explorable graph — not a black-box score. Every conclusion cites specific, located sentences from the transcript; nothing is asserted without a traceable, weighted path back to the source text.
 
-## Academic basis
-
-**Matera 2024** ([arXiv:2511.15214](https://arxiv.org/abs/2511.15214)) defines the six dimensions used here: Forward Guidance, Uncertainty, Confidence, Sentiment, Macro Focus, and Jargon.
-
-**"Fast Numbers, Slow Language"** ([arXiv:2606.29734](https://arxiv.org/abs/2606.29734)) informed the discrete five-anchor label scale (`strong_negative`..`strong_positive`) used per theme.
-
-There is no numeric composite score. Earlier iterations of this project scored each dimension as an average float and combined the six into a single weighted number — those weights were never validated against anything, and averaging LLM-classified labels manufactures precision that isn't there. This version replaces that with grounded, cited narrative themes plus a coarse label per theme.
+![Analysis view — the evidence graph, dimension tabs, weight filter, and transcript jump](docs/screenshots/analysis.png)
 
 ## What it does
 
-1. **Sentence split.** The transcript is deterministically split into sentences, each with a real, absolute offset into the source text — no model involved.
-2. **Base grouping.** Sentences are grouped into small overlapping windows (~4-5 sentences, sharing one sentence with each neighbor).
-3. **Recursive collapse.** One call per group produces, for all six dimensions at once: a relevance weight for each input sentence/composite, and a short grounded composite passage. The same call is reused recursively — composites from one round become inputs to the next — until each dimension is down to a handful (~4-5) of terminal themes, each carrying a coarse label.
-4. **Deterministic attribution.** After the collapse finishes, a pure-code pass (no model call) chains every round's relevance weights together to compute exactly how much each original sentence contributed to each final theme — a real, computable importance score, not just "cited or not."
-5. **UI.** Streamlit shows each dimension's themes as cards (label + narrative); clicking one renders the full transcript with a heatmap — sentence highlight intensity proportional to that sentence's computed importance to the selected theme.
+Give it a transcript (paste text or upload a PDF) and it will:
 
-## Why this shape
+1. Split it into sentences, each with a real offset into the source text.
+2. Judge every sentence, in small groups, along six dimensions at once — **Forward Guidance, Uncertainty, Confidence, Sentiment, Macro Focus, Jargon**.
+3. Recursively summarize and re-judge those groups' outputs, round after round, until each dimension converges to a handful of final, labeled conclusions.
+4. Show the whole thing as a live graph you can zoom, pan, drag, filter by relevance, and click into — down to the exact sentence a conclusion is built from.
 
-- **Sentence-level, not whole-section.** A single call judging six dimensions over an entire ~20k-word section is the wrong task for a small local model. Judging six dimensions over 4-5 sentences at a time is a much easier, more reliable task — and the same signature is reused recursively at every level, so the total interface stays small.
-- **Classification, not floats.** Both the relevance weights (`none/weak/moderate/strong`) and the per-theme labels are discrete classifications. Local models are reliable classifiers; they are not reliable at inventing calibrated numbers, and nothing in this pipeline asks them to.
-- **Citations by construction, not by verification.** The model never reproduces transcript text — it references inputs by index. There is nothing to hallucinate or fuzzy-match against the source, because nothing above the leaf (sentence) layer ever claims to *be* source text.
-- **One label per theme, not one per dimension.** Aggregating several themes' labels into a single dimension-level verdict reintroduces exactly the majority-vote-with-ties problem an earlier version of this codebase had (label and score silently disagreeing). Each theme keeps its own label instead.
+There is no single composite score. An earlier version of this project averaged the six dimensions into one weighted number; those weights were never validated against anything, and averaging LLM-classified labels manufactures a precision that isn't there. This version keeps every dimension's conclusions separate, grounded, and cited.
 
-## Tech stack
+## Academic basis
 
-- **DSPy** for structured signatures — kept specifically because a future prompt-optimization pass (a larger model generating training data, `BootstrapFewShot` compiling it into few-shot demonstrations for the local model) depends on it directly.
-- **Ollama**, serving a local model (default: Qwen3-4B-Instruct) through an OpenAI-compatible endpoint. Benchmarked against Qwen2.5-7B-Instruct Q4_K_M with caching disabled and identical terse-summary prompts on both: Qwen3-4B ran ~25-30% faster (~33s vs. ~43-45s on a 12-sentence test transcript) thanks to a real per-token speed advantage (65.6 tok/s vs. 31.8 tok/s measured directly against Ollama).
-- **SQLite (WAL mode)** as the graph store — nodes and edges for every collapse level, written incrementally so a live viewer can read the graph while the pipeline is still building it, and so an interrupted run resumes instead of restarting.
-- **Streamlit** for the UI, **Plotly**-free now (no composite score to chart); **pypdf** for PDF transcript extraction.
+**Matera 2024** ([arXiv:2511.15214](https://arxiv.org/abs/2511.15214)) defines the six dimensions used here.
+
+**"Fast Numbers, Slow Language"** ([arXiv:2606.29734](https://arxiv.org/abs/2606.29734)) informed the discrete five-anchor label scale (`strong_negative`..`strong_positive`) used per conclusion.
+
+## Architecture
+
+### The pipeline: recursive weighted collapse
+
+The core idea is a single signature — "given a small group of inputs, score each one's relevance per dimension and write one grounded summary sentence per dimension" — applied recursively:
+
+```
+sentences (level 0)
+  → base windows, ~20 sentences each, one call per window     (level 1: composites)
+    → grouped by branching_factor, one call per group          (level 2: composites)
+      → ... repeats until each dimension has ≤ target composites, marked terminal
+```
+
+Every call scores its own inputs' relevance (0–3, normalized to sum to 1 among siblings) *and* writes the next round's input text — so a model never has to judge an entire transcript at once, only a handful of short passages, and every composite's text is traceable back through the exact chain of weighted edges that produced it. Level 1 is a single shared call across all six dimensions per window (`DimensionCollapse`); level 2 onward, composites have already diverged per dimension, so one call still covers all six but reads a separate input list per dimension (`DimensionCollapseBundled`). Prompts run through a compact, hand-rolled parser (`modules/raw_collapse_predictor.py`) rather than DSPy's default adapter — measured ~2.5–2.9x faster for the same model and task, since most of the default adapter's output is scaffolding, not model content.
+
+Everything is written to a SQLite (WAL-mode) graph store as it's produced (`persistence/graph_store.py`) — nodes and edges, level by level — so a live viewer can read the graph while the pipeline is still building it, and an interrupted run resumes from the last completed level instead of restarting.
+
+### Weight, without the propagation artifact
+
+Every edge carries a real relevance weight from the model's own scoring. The natural way to ask "how much does this sentence matter" is to chain those weights from a final conclusion back down to its sentences — but that number shrinks with every hop and sibling a sentence's path happens to pass through, which is a tree-shape artifact, not a relevance signal. `analysis/attribution.py`'s `compute_node_weights` instead scores only source sentences, using each one's own single-hop edge weight, peak-normalized across the dimension. Composites and terminal conclusions get no score of their own — the UI derives their visibility bottom-up: a composite stays lit as long as *any* sentence beneath it clears the weight threshold; whole branches where nothing did go dark, which is the intended behavior of a relevance filter, not a bug.
+
+### The graph UI
+
+The graph is a real bidirectional Streamlit component (`ui/graph_component.py`, `ui/graph_frontend/index.html` — plain D3 + hand-rolled Streamlit component protocol, no build tooling), not a redraw-on-every-poll `st.components.v1.html` blast. That distinction is what makes the rest of it possible:
+
+- **Streams in incrementally.** New nodes/edges get merged into the *same* running force simulation as levels complete — nothing already on screen gets rebuilt or repositioned.
+- **Dimension focus is a pure restyle.** Selecting a dimension (vertical tabs, left of the theme cards) dims everything else to near-invisible and dulls the selected dimension's own resting color — hovering a node lights it up along with its first-order neighbors in that dimension, tracing structure without ever touching the underlying simulation.
+- **A synthetic per-dimension hub** (no LLM, purely structural) links every terminal conclusion for a dimension, pulling a dimension's final themes visibly together instead of relying on a soft anchor force alone.
+- **A weight slider filters continuously** — client-side, `input`-event-driven, no Streamlit rerun — hiding source sentences below a relevance threshold and letting composite visibility fall out bottom-up, as described above.
+- **Click a source sentence** to jump to and highlight its exact span in a transcript panel underneath, auto-scrolled into view.
+- Interactive throughout: zoom, pan, drag any node.
+
+### Deterministic attribution for citations
+
+Separately from the weight-filter score, `compute_attribution` chains every round's relevance weights together (a weighted breadth-first walk from each terminal down to its leaves) to compute exactly how much each sentence explains *that specific conclusion* — a real, computable share, not "cited or not." That's what powers the ranked evidence list under each theme card.
 
 ## Project structure
 
 ```
-app.py                          Streamlit UI — theme cards + evidence heatmap
-src/earnings_analyser/
-  config.py                     DSPy + local Ollama configuration
-  pipeline.py                   Wires a live predictor to the collapse orchestration
-  report.py                     Builds the {dimension: [themes]} shape the UI consumes
-  data/
-    sentence_split.py           Deterministic sentence split + overlapping base windows
-    pdf_extract.py               PDF to text extraction
-  signatures/
-    dimension_collapse.py       The one recurring signature: 6-dimension relevance + summary + (terminal) label
-    common.py                    Shared label scale and dimension list
-  modules/
-    collapse_step.py            One level of the recursion, and the full orchestration loop
-  analysis/
-    attribution.py               Pure-code weighted-path attribution (no model calls)
-  persistence/
-    graph_store.py               SQLite/WAL-backed node/edge store, resumable
+app.py                              Streamlit UI — phases, progress bar, panel, transcript jump
+requirements.txt / pyproject.toml   Dependencies
+.streamlit/config.toml              Theme (purple-on-black, Libre Baskerville) — Streamlit-mandated location
+fixtures/
+  sample_transcript.txt             A real, full-size earnings call transcript
+  sample_run.sqlite                 A completed graph store built from it (see below)
 scripts/
-  smoke_test.py                  Manual check that the local Ollama endpoint is reachable
-tests/                           pytest coverage for the deterministic parts (offsets, graph store, attribution math)
+  generate_ui_fixture.py            Regenerates fixtures/sample_run.sqlite (spends real LLM calls)
+  smoke_test.py                     Manual check that the configured backend is reachable
+src/earnings_analyser/
+  config.py                         Backend profiles (cloud/local) + DSPy configuration
+  pipeline.py                       Wires a live predictor to the collapse orchestration
+  report.py                         Builds the {dimension: [themes]} shape the UI consumes
+  data/
+    sentence_split.py               Deterministic sentence split + overlapping base windows
+    pdf_extract.py                  PDF to text extraction
+  signatures/
+    dimension_collapse.py           The one recurring signature: 6-dimension relevance + summary + (terminal) label
+    common.py                       Shared label scale and dimension list
+  modules/
+    collapse_step.py                One level of the recursion, the orchestration loop, call-count estimation
+    raw_collapse_predictor.py       Compact-prompt predictor (bypasses DSPy's default adapter)
+  analysis/
+    attribution.py                  Pure-code weight computations (no model calls)
+  persistence/
+    graph_store.py                  SQLite/WAL-backed node/edge store, resumable
+  ui/
+    graph_component.py              Python side of the bidirectional graph component
+    graph_frontend/index.html       The graph itself — D3 + hand-rolled Streamlit component protocol
+docs/
+  screenshots/                      README images
+tests/                              pytest coverage for the deterministic parts
 ```
 
 ## Setup
 
-Requires Python 3.12 and a local [Ollama](https://ollama.com) install.
+Requires Python 3.12 and a Google Gemini API key (this project's cloud backend).
 
 ```bash
-ollama pull qwen2.5:7b-instruct-q4_K_M
-ollama serve   # if not already running
-
 python -m venv .venv
-.venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/python -m pip install -r requirements.txt
+# or: .venv/bin/python -m pip install -e ".[dev]"   (editable install + pytest)
 ```
+
+Copy `.env.example` to `.env` and fill in:
+
+```bash
+GOOGLE_API_KEY=your-gemini-api-key-here
+EARNINGS_ANALYSER_BACKEND=cloud
+```
+
+A local backend also exists (Ollama, no cloud key required — see `.env.example` and `config.py`'s `BACKEND_PROFILES`), but the cloud profile is what this project is built and tuned around today.
 
 Use `.venv/bin/python -m <tool>` rather than `.venv/bin/<tool>` directly — a venv's console scripts hardcode their creation path in the shebang line, so `.venv/bin/streamlit` (etc.) breaks with "file not found" if the project directory is ever moved or renamed after the venv was created; invoking through `python -m` doesn't have that problem.
 
@@ -77,7 +121,17 @@ Use `.venv/bin/python -m <tool>` rather than `.venv/bin/<tool>` directly — a v
 .venv/bin/python -m streamlit run app.py
 ```
 
-Paste transcript text or upload a PDF in the sidebar, click Analyze, then pick a dimension and click a theme card to see its evidence heatmap.
+Paste transcript text or upload a PDF, click Analyze, then watch the graph build. Once complete: pick a dimension from the left-side tabs, drag the weight slider to filter by relevance, click any source sentence to jump to it in the transcript below.
+
+### Try it without spending API calls
+
+Click **"Test with sample data (no LLM call)"** on the input screen instead of analyzing your own transcript. It replays `fixtures/sample_run.sqlite` — a real, production-size run already completed against `fixtures/sample_transcript.txt` — streaming it into the graph exactly like a live run (same pacing, same progressive reveal), so the whole UI can be exercised repeatedly without touching a real backend or its rate limit. Regenerate that fixture (after a pipeline change, for example) with:
+
+```bash
+.venv/bin/python scripts/generate_ui_fixture.py
+```
+
+That script *does* make real calls against your configured backend — it's the one time this fixture path is meant to.
 
 ## Running tests
 
@@ -85,17 +139,6 @@ Paste transcript text or upload a PDF in the sidebar, click Analyze, then pick a
 .venv/bin/python -m pytest tests/
 ```
 
-All current tests are pure — no network or live model required. They cover sentence-split offset correctness (including window overlap), the graph store's read/write/resumability behavior, and the attribution math (single-level weights, multi-level chains, and multi-parent convergence at overlapping window boundaries).
+All tests are pure — no network or live model required. They cover sentence-split offset correctness (including window overlap), the graph store's read/write/resumability behavior, the compact-prompt parser's recovery from malformed model output, and the attribution/weight math (single-level weights, multi-level chains, multi-parent convergence, and the source-only weight scoring).
 
-## Current status
-
-Implemented: sentence split, overlapping base windows, the merged collapse signature, the recursive collapse orchestration with resumability, deterministic attribution, the SQLite/WAL graph store, and the Streamlit UI (theme cards + heatmap).
-
-Not yet done:
-
-- **Empirical tuning.** Branching factor per collapse round, and behavior on very short transcripts, are set to reasonable defaults but not yet tuned against real transcripts.
-- **Concurrency's real ceiling.** Client-side thread-pool concurrency for independent collapse calls is implemented, but measured only a ~4% wall-clock improvement on this hardware (6GB GPU, model already using ~4.77GB VRAM) — Ollama appears to serialize requests server-side regardless of client concurrency here. The code is correct and harmless but isn't the win it might look like on paper; call-count reduction (branching factor, window size) matters more than parallelism on this setup.
-- **DSPy prompt optimization.** A separate, not-yet-started workstream: generate training data with a larger teacher model, compile it into few-shot demonstrations for the local model via `BootstrapFewShot`.
-- **Live graph visualization.** The graph store's SQLite/WAL design supports a concurrent reader while the pipeline writes, but no viewer has been built yet.
-
-See `implementation-plan.md` for the full architecture writeup and the reasoning behind each decision.
+![Input view](docs/screenshots/input.png)
