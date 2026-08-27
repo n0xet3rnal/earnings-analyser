@@ -11,11 +11,12 @@ Two top-level phases, tracked in `st.session_state["phase"]`:
       both "analyzing" and "complete" internally via `status["done"]`,
       never crossing a full `st.rerun()` between them. `run_pipeline` runs
       in a background thread while the fragment polls the (WAL-mode)
-      GraphStore every 1s and streams new nodes into the graph component
-      as levels complete; once done, the same fragment starts rendering
-      the report panel and dimension-tab highlighting instead — kept in
-      one fragment specifically so the graph's iframe is never torn down
-      and remounted at that transition (see `render_graph_phase`).
+      GraphStore every 1s and shows a progress bar plus a growing log of
+      completed levels (no live graph — it was too fragile to render
+      mid-build); once done, the same fragment mounts the graph for the
+      first time and renders the report panel and dimension-tab
+      highlighting — kept in one fragment simply to avoid a full-page
+      rerun on every 1s poll tick (see `render_graph_phase`).
 """
 
 import hashlib
@@ -281,6 +282,8 @@ def _start_analysis(transcript_text: str = "", use_fixture: bool = False) -> Non
     st.session_state["levels_fetched"] = set()
     st.session_state["graph_nodes"] = []
     st.session_state["graph_edges"] = []
+    st.session_state["analysis_log"] = ["Reading transcript..."]
+    st.session_state["logged_level"] = -1
 
 
 def render_input_phase() -> None:
@@ -374,15 +377,9 @@ def _render_transcript_panel(transcript_text: str, selected: dict | None) -> Non
 
 
 # Analyzing and complete are ONE fragment, not two functions crossed by a
-# st.rerun() — that boundary was the actual cause of the jarring redraw:
-# a component inside a `st.fragment` container lives in a different DOM
-# subtree than the same call made from a plain top-level function, so even
-# with matching column layout, leaving the fragment forced Streamlit to
-# tear down and remount the graph's iframe (losing the running simulation,
-# all node positions, drag state — everything) right at the moment the
-# view is supposed to settle. Never leaving the fragment (branching
-# internally on `status["done"]` instead of flipping `st.session_state["phase"]`)
-# keeps the same component instance alive across that transition.
+# st.rerun() — simply to avoid a full-page rerun on every 1s poll tick.
+# The graph itself is never mounted until analysis completes, so there's
+# no remount concern to design around here.
 @st.fragment(run_every="1s")
 def render_graph_phase() -> None:
     status = st.session_state["analysis_status"]
@@ -395,9 +392,14 @@ def render_graph_phase() -> None:
     # made it into graph_nodes/graph_edges before rendering stopped syncing).
     with GraphStore(st.session_state["db_path"]) as store:
         last_level = _sync_graph_data(store)
+        if last_level > st.session_state["logged_level"]:
+            st.session_state["logged_level"] = last_level
+            st.session_state["analysis_log"].append(f"Level {last_level} composed")
         if status["done"] and status["error"] is None and "report" not in st.session_state:
+            st.session_state["analysis_log"].append("Finalizing report...")
             st.session_state["report"] = status["report"]
             st.session_state["active_dim"] = DIMENSIONS[0]
+            st.session_state["analysis_log"].append("Analysis complete.")
 
     if status["done"] and status["error"] is not None:
         st.session_state["last_error"] = status["error"]
@@ -405,19 +407,18 @@ def render_graph_phase() -> None:
         st.rerun()
         return
 
-    canvas_col, panel_col = st.columns([1.5, 1], gap="large")
-
     if not status["done"]:
-        with panel_col:
-            level_note = f"level {last_level} composed" if last_level else "reading the transcript..."
-            st.caption(f"Building the evidence graph — {level_note}")
-            calls_total = max(status["calls_total"], 1)
-            calls_done = min(status["calls_done"], calls_total)  # clamp defensively against any estimate/actual drift
-            st.progress(calls_done / calls_total, text=f"{calls_done} / {calls_total} calls")
-        with canvas_col:
-            render_graph(st.session_state["graph_nodes"], st.session_state["graph_edges"], active_dim=None, dim_colors=DIM_COLORS, height=GRAPH_HEIGHT)
+        _left, mid, _right = st.columns([1, 2, 1])
+        with mid:
+            with st.status("Analyzing transcript...", expanded=True, state="running"):
+                calls_total = max(status["calls_total"], 1)
+                calls_done = min(status["calls_done"], calls_total)  # clamp defensively against any estimate/actual drift
+                st.progress(calls_done / calls_total, text=f"{calls_done} / {calls_total} calls")
+                for line in st.session_state["analysis_log"]:
+                    st.write(line)
         return
 
+    canvas_col, panel_col = st.columns([1.5, 1], gap="large")
     report = st.session_state["report"]
     with panel_col:
         tab_col, cards_col = st.columns([2, 3], gap="medium")
@@ -444,9 +445,16 @@ def render_graph_phase() -> None:
 
     _render_transcript_panel(report["transcript_text"], st.session_state.get("selected_sentence"))
 
+    st.download_button(
+        "Save this run",
+        data=st.session_state["db_path"].read_bytes(),
+        file_name=st.session_state["db_path"].name,
+        mime="application/octet-stream",
+    )
+
     if st.button("Analyze another transcript"):
         for key in ("phase", "report", "graph_nodes", "graph_edges", "levels_fetched", "active_dim",
-                    "analysis_status", "db_path", "selected_sentence"):
+                    "analysis_status", "db_path", "selected_sentence", "analysis_log", "logged_level"):
             st.session_state.pop(key, None)
         st.session_state["phase"] = "input"
         st.rerun()
