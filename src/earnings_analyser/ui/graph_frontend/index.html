@@ -55,10 +55,12 @@ const HOVER_RADIUS = 16; // px — roughly one cursor-width in any direction, no
 const HOVER_MAX = 3;
 const TOOLTIP_W = 220;
 const LEADER_STROKE_WIDTH = 1; // graph edges are set a bit thicker than this, so real structure reads as more prominent than a hover callout
+const ZOOM_EXTENT = [0.1, 8];
 
 let initialized = false;
 let root, svg, zoomLayer, linkLayer, nodeLayer, sim;
 let currentTransform = null; // set once d3.zoom is wired up in init(); screen <-> world coordinate mapping
+let zoomBehavior = null; // the zoom slider drives this programmatically; wheel/drag zoom syncs the slider back
 let nodeSel = null, linkSel = null;
 let allNodes = [], allLinks = [];
 // Nodes wait here, undrawn, until an edge shows up that connects them to
@@ -67,13 +69,10 @@ let allNodes = [], allLinks = [];
 // entirely, not merely hidden, since it has nothing to show anyway.
 let pendingNodes = new Map();
 let nodeById = new Map(), linkKeys = new Set();
-let parentOf = new Map(); // child id -> parent id, within its own dimension — the tree is single-parent today
-let aliveSet = null; // recomputed by recomputeAliveSet(); null means "no weight filter active, everyone passes"
 let dimColorMap = {}, sourceColor = "#5B6494";
 let dimCenter = {}, cx = 0, cy = 0, width = 0, height = 480;
 let currentActiveDim = null;
 let highlightedIds = new Set(); // hover spotlight: hovered node(s) + their first-order neighbors in the active dimension
-let weightThreshold = 0; // weight slider — a node below this, within the active dimension, is fully hidden
 const HUB_EDGE_WEIGHT = 0.5;
 let quad = null;
 let tooltipEls = [], leaderSel = null;
@@ -118,44 +117,6 @@ function baseColorFor(d) {
   return dimColorMap[d.dimension] || "#888";
 }
 
-// weightByDim (see app.py's _attach_node_weights) only scores source
-// sentences — their own single-hop relevance judgment, nothing
-// compounded through the tree (see compute_node_weights). A
-// composite/terminal's visibility is derived bottom-up instead: alive
-// if any sentence beneath it passes. Recomputed here in one linear pass
-// over the sentences whenever the threshold or active dimension changes
-// (called from applyHighlight, which already runs on every relevant
-// event) rather than a per-node recursive check in the render loop —
-// cheap, and the early-exit on an already-marked ancestor means a
-// shared ancestor's cost is paid once, not once per descendant.
-function recomputeAliveSet() {
-  if (!currentActiveDim || weightThreshold <= 0) { aliveSet = null; return; }
-  const alive = new Set();
-  allNodes.forEach(n => {
-    if (n.kind !== "source_sentence") return;
-    const w = (n.weightByDim && n.weightByDim[currentActiveDim]) || 0;
-    if (w < weightThreshold) return;
-    let id = n.id;
-    while (id && !alive.has(id)) {
-      alive.add(id);
-      id = parentOf.get(id + "|" + currentActiveDim);
-    }
-  });
-  aliveSet = alive;
-}
-
-function passesWeightFilter(d) {
-  if (!aliveSet) return true;
-  if (d.kind) return d.kind === "hub" || aliveSet.has(d.id);
-  // A link (no `.kind`) — hidden if either endpoint is (hub endpoints
-  // are always alive, same exemption as above).
-  const childAlive = aliveSet.has(d.child) || nodeById.get(d.child)?.kind === "hub";
-  const parentAlive = aliveSet.has(d.parent) || nodeById.get(d.parent)?.kind === "hub";
-  return childAlive && parentAlive;
-}
-
-// A node's own weight (see passesWeightFilter) is an absolute cut, not
-// something hover overrides — check it before any highlight logic at all.
 // Everything outside the selected dimension drops to near-invisible —
 // not just dimmed, out of the way — while the selected dimension's own
 // nodes stay dull, deliberately far below "in focus," a quiet skeleton
@@ -164,7 +125,6 @@ function passesWeightFilter(d) {
 // updateHighlightFromHover) is what promotes something out of that
 // skeleton to fully visible.
 function opacityFor(d, activeDim, isHighlighted) {
-  if (!passesWeightFilter(d)) return 0;
   if (!activeDim) return d.dimension ? 0.85 : 0.9;
   if (isHighlighted) return 1;
   // Not literally zero — the rest of the graph still needs to read as a
@@ -192,7 +152,6 @@ function glowFor(d, activeDim, isHighlighted) {
 
 function applyHighlight(activeDim, highlightedIds) {
   if (!nodeSel || !linkSel) return;
-  recomputeAliveSet();
   nodeSel.style("opacity", d => opacityFor(d, activeDim, highlightedIds.has(d.id)))
     .attr("fill", d => colorFor(d, activeDim, highlightedIds.has(d.id)))
     .style("filter", d => glowFor(d, activeDim, highlightedIds.has(d.id)));
@@ -222,8 +181,7 @@ function updateHighlightFromHover(found) {
 }
 
 function rebuildQuadtree() {
-  quad = d3.quadtree().x(d => d.x).y(d => d.y)
-    .addAll(allNodes.filter(d => d.text && passesWeightFilter(d)));
+  quad = d3.quadtree().x(d => d.x).y(d => d.y).addAll(allNodes.filter(d => d.text));
 }
 
 function ticked() {
@@ -354,22 +312,7 @@ function mergeData(nodes, edges) {
   let added = false;
 
   nodes.forEach(n => {
-    // weightByDim is computed in Python only once the run completes (it
-    // needs the full sentence set to normalize against), well after most
-    // nodes have already streamed in and been promoted here — so a node
-    // already known still needs this one field patched in when it shows
-    // up, not silently ignored the way a truly-redundant repeat payload
-    // should be.
-    if (nodeById.has(n.id)) {
-      const existing = nodeById.get(n.id);
-      if (n.weightByDim && !existing.weightByDim) existing.weightByDim = n.weightByDim;
-      return;
-    }
-    if (pendingNodes.has(n.id)) {
-      const existing = pendingNodes.get(n.id);
-      if (n.weightByDim && !existing.weightByDim) existing.weightByDim = n.weightByDim;
-      return;
-    }
+    if (nodeById.has(n.id) || pendingNodes.has(n.id)) return;
     pendingNodes.set(n.id, n);
   });
 
@@ -379,13 +322,6 @@ function mergeData(nodes, edges) {
     const childKnown = nodeById.has(e.child) || pendingNodes.has(e.child);
     const parentKnown = nodeById.has(e.parent) || pendingNodes.has(e.parent);
     if (!childKnown || !parentKnown) return; // one side hasn't streamed in yet; retried on a later merge
-
-    // Keyed by child+dimension, not just child — a source sentence can have
-    // a different parent in each dimension it's relevant to (a composite
-    // only ever has one, since its own edges are all within its own
-    // dimension, so this key scheme is consistent at every hop up).
-    const parentKey = e.child + "|" + e.dimension;
-    if (!parentOf.has(parentKey)) parentOf.set(parentKey, e.parent);
 
     [e.child, e.parent].forEach(id => {
       if (!pendingNodes.has(id)) return;
@@ -414,32 +350,41 @@ function mergeData(nodes, edges) {
   }
 }
 
-// Plain range input, not a Streamlit widget — a Streamlit slider reruns
-// the whole script on release (or worse, mid-drag), which is exactly the
-// redraw this needs to avoid. `input` fires continuously as the user
-// drags; each tick just re-runs the existing applyHighlight() restyle
-// (opacity/color only, see passesWeightFilter/opacityFor) — no simulation
-// or DOM rebuild, so it stays smooth regardless of node count.
-function createWeightSlider() {
+// Plain range input, not a Streamlit widget — stays entirely client-side,
+// no rerun involved. Drives d3.zoom programmatically via scaleTo (fixed
+// on the canvas center, same as a keyboard/UI zoom control would), and
+// the zoom behavior's own "zoom" handler calls .sync() back on every
+// wheel/drag interaction so the slider always reflects the true current
+// scale regardless of which control was used last.
+function createZoomSlider() {
   const wrap = document.createElement("div");
   wrap.style.cssText = "position:absolute;left:14px;bottom:14px;display:flex;align-items:center;gap:8px;" +
     "background:rgba(15,13,22,0.85);padding:6px 12px;border-radius:999px;border:1px solid #211C2E;" +
     "font:12px 'Libre Baskerville',Georgia,serif;color:#B9B2CC;z-index:5;";
   const label = document.createElement("span");
-  label.textContent = "weight ≥";
+  label.textContent = "zoom";
   const input = document.createElement("input");
-  input.type = "range"; input.min = "0"; input.max = "1"; input.step = "0.01"; input.value = "0";
+  input.type = "range";
+  input.min = String(ZOOM_EXTENT[0]);
+  input.max = String(ZOOM_EXTENT[1]);
+  input.step = "0.01";
+  input.value = "1";
   input.style.width = "120px";
-  const value = document.createElement("span");
-  value.textContent = "0.00";
-  value.style.cssText = "min-width:2.6em;text-align:right;";
+  const valueEl = document.createElement("span");
+  valueEl.textContent = "1.00x";
+  valueEl.style.cssText = "min-width:3.4em;text-align:right;";
   input.addEventListener("input", () => {
-    weightThreshold = parseFloat(input.value);
-    value.textContent = weightThreshold.toFixed(2);
-    applyHighlight(currentActiveDim, highlightedIds);
+    if (!zoomBehavior) return;
+    svg.call(zoomBehavior.scaleTo, parseFloat(input.value));
   });
-  wrap.appendChild(label); wrap.appendChild(input); wrap.appendChild(value);
+  wrap.appendChild(label); wrap.appendChild(input); wrap.appendChild(valueEl);
   root.appendChild(wrap);
+  return {
+    sync(k) {
+      input.value = k;
+      valueEl.textContent = k.toFixed(2) + "x";
+    },
+  };
 }
 
 function ensureTooltips() {
@@ -605,16 +550,17 @@ function init(args) {
   linkLayer = zoomLayer.append("g");
   nodeLayer = zoomLayer.append("g");
   ensureTooltips();
-  createWeightSlider();
+  const zoomSlider = createZoomSlider();
 
   currentTransform = d3.zoomIdentity;
-  const zoom = d3.zoom()
-    .scaleExtent([0.1, 8])
+  zoomBehavior = d3.zoom()
+    .scaleExtent(ZOOM_EXTENT)
     .on("zoom", event => {
       currentTransform = event.transform;
       zoomLayer.attr("transform", currentTransform);
+      zoomSlider.sync(currentTransform.k);
     });
-  svg.call(zoom);
+  svg.call(zoomBehavior);
 
   createDimensionHubs();
 

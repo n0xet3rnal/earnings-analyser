@@ -30,7 +30,6 @@ from pathlib import Path
 
 import streamlit as st
 
-from earnings_analyser.analysis.attribution import compute_node_weights
 from earnings_analyser.config import BACKEND_PROFILES, configure_dspy
 from earnings_analyser.data.pdf_extract import extract_pdf_text
 from earnings_analyser.modules.collapse_step import estimate_call_count
@@ -373,26 +372,6 @@ def _render_transcript_panel(transcript_text: str, selected: dict | None) -> Non
     st.iframe(src="data:text/html;charset=utf-8," + urllib.parse.quote(doc), height=340)
 
 
-def _attach_node_weights(store: GraphStore) -> None:
-    """Per-dimension source-sentence weight (see `compute_node_weights`)
-    — computed once, right when the run completes, and patched onto the
-    already-accumulated `graph_nodes` payload so the graph component's
-    weight slider has something to threshold. Only source sentences get
-    a `weightByDim` entry — composites/terminals have no score of their
-    own; the frontend derives their visibility bottom-up from whichever
-    descendant sentences pass (see `recomputeAliveSet` in
-    `graph_frontend/index.html`). A sentence can appear under more than
-    one dimension's tree, so it gets one entry per dimension it actually
-    shows up in."""
-    weights_by_dim = {dim: compute_node_weights(store, dim) for dim in DIMENSIONS}
-    for node in st.session_state["graph_nodes"]:
-        if node["kind"] != "source_sentence":
-            continue
-        node["weightByDim"] = {
-            dim: w[node["id"]] for dim, w in weights_by_dim.items() if node["id"] in w
-        }
-
-
 # Analyzing and complete are ONE fragment, not two functions crossed by a
 # st.rerun() — that boundary was the actual cause of the jarring redraw:
 # a component inside a `st.fragment` container lives in a different DOM
@@ -418,7 +397,6 @@ def render_graph_phase() -> None:
         if status["done"] and status["error"] is None and "report" not in st.session_state:
             st.session_state["report"] = status["report"]
             st.session_state["active_dim"] = DIMENSIONS[0]
-            _attach_node_weights(store)  # store is still open here — needed for the edge walk
 
     if status["done"] and status["error"] is not None:
         st.session_state["last_error"] = status["error"]

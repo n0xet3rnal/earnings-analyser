@@ -48,29 +48,3 @@ def compute_attribution(store: GraphStore, dimension: str) -> dict[str, dict[str
         result[terminal.node_id] = dict(leaf_importance)
 
     return result
-
-
-def compute_node_weights(store: GraphStore, dimension: str) -> dict[str, float]:
-    """Returns {sentence_node_id: weight} for every source sentence in
-    this dimension's tree — its own edge weight to its immediate
-    (base-level) parent, peak-normalized across the dimension.
-
-    Deliberately just the one hop, not a multi-level backprop: chaining
-    weights down from a terminal (as an earlier version of this function
-    did) makes a sentence's score shrink with every hop and sibling its
-    path happens to pass through — a tree-shape artifact, not a
-    relevance signal. This is the model's direct, single-hop relevance
-    judgment for that sentence, which is what a relevance filter should
-    actually threshold on. Composites/terminals get no score of their
-    own here; the UI derives their visibility bottom-up instead — a
-    composite stays visible if any sentence beneath it passes the
-    threshold (see `graph_frontend/index.html`'s `recomputeAliveSet`).
-    """
-    sentence_ids = {n.node_id for n in store.nodes_at_level(0)}
-    raw: dict[str, float] = defaultdict(float)
-    for e in store.edges_for_dimension(dimension):
-        if e.child in sentence_ids:
-            raw[e.child] = max(raw[e.child], e.weight)
-
-    peak = max(raw.values(), default=1.0) or 1.0
-    return {node_id: score / peak for node_id, score in raw.items()}
