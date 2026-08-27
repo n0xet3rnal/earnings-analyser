@@ -20,10 +20,12 @@ Two top-level phases, tracked in `st.session_state["phase"]`:
 
 import hashlib
 import html
+import re
 import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 from pathlib import Path
 
 import streamlit as st
@@ -84,15 +86,19 @@ st.markdown(
         box-shadow: 0 8px 28px rgba(0,0,0,0.5);
       }
 
-      .stTabs [data-baseweb="tab"] {
-        border-radius: 999px;
+      .stTabs [data-testid="stTab"] {
         transition: background 0.2s ease, color 0.2s ease;
       }
     }
     div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 1.1rem !important; }
     [data-testid="stExpander"] { border-radius: 1rem !important; overflow: hidden; }
-    .stTabs [data-baseweb="tab-list"] { gap: 4px; }
-    .stTabs [aria-selected="true"] { background: rgba(139,92,246,0.18); }
+    .stTabs [role="tablist"] { gap: 4px; }
+    .stTabs [data-testid="stTab"] {
+      border-radius: 999px !important;
+      padding: 6px 18px !important;
+      height: auto !important;
+    }
+    .stTabs [data-testid="stTab"][aria-selected="true"] { background: rgba(139,92,246,0.18); }
 
     /* Dimension picker: a plain st.radio, restyled to read as a vertical
        tab list (left accent bar, no radio dot) rather than a form control. */
@@ -327,30 +333,44 @@ def _render_transcript_panel(transcript_text: str, selected: dict | None) -> Non
     """Always visible, below the graph — a placeholder until a source-
     sentence node is clicked (see the `click` handler in
     `ui/graph_frontend/index.html`), then the full transcript with that
-    sentence highlighted and scrolled into view. A one-shot
-    `components.v1.html` render, not the persistent declared component the
-    graph uses — this doesn't need incremental state, and re-rendering a
-    short HTML blob on each click is expected, not the "no redraw" case
-    that mattered for the graph/weight-slider."""
+    sentence highlighted and scrolled into view. A one-shot `st.iframe`
+    render (via a data: URI — `st.components.v1.html` is past its removal
+    date in this Streamlit version and was silently producing no iframe
+    at all), not the persistent declared component the graph uses — this
+    doesn't need incremental state, and re-rendering a short HTML blob on
+    each click is expected, not the "no redraw" case that mattered for
+    the graph/weight-slider."""
     st.divider()
     st.caption("Transcript")
     if not selected:
         st.caption("Click a sentence node in the graph to jump to it here.")
         return
 
+    # PDF-extracted transcripts carry a hard newline roughly every ~80
+    # characters — the source PDF's own line wrapping, unrelated to
+    # sentence boundaries. Rendered verbatim under `white-space: pre-wrap`
+    # (needed to keep genuine paragraph breaks), every one of those forces
+    # an early line break, which is why the panel read as using only
+    # half its width. Swapping lone newlines for spaces is a 1-for-1
+    # character substitution, so it doesn't shift any sentence's
+    # start/end offset — genuine paragraph breaks (blank lines) are left
+    # alone.
+    display_text = re.sub(r"(?<!\n)\n(?!\n)", " ", transcript_text)
+
     start, end = selected["start"], selected["end"]
-    before = html.escape(transcript_text[:start])
-    target = html.escape(transcript_text[start:end])
-    after = html.escape(transcript_text[end:])
-    doc = f"""
-    <div id="transcript-scroll" style="max-height:320px;overflow-y:auto;padding:16px 20px;
+    before = html.escape(display_text[:start])
+    target = html.escape(display_text[start:end])
+    after = html.escape(display_text[end:])
+    doc = f"""<!doctype html><html><body style="margin:0;background:transparent;">
+    <div id="transcript-scroll" style="max-height:320px;width:100%;overflow-y:auto;padding:16px 20px;
          background:#0F0D16;border:1px solid #211C2E;border-radius:0.8rem;
          font-family:'Libre Baskerville',Georgia,serif;color:#B9B2CC;line-height:1.7;
          white-space:pre-wrap;box-sizing:border-box;">{before}<mark id="jump-target"
          style="background:#8B5CF6;color:#06060A;padding:0 2px;border-radius:3px;">{target}</mark>{after}</div>
     <script>document.getElementById('jump-target').scrollIntoView({{block: 'center'}});</script>
+    </body></html>
     """
-    st.components.v1.html(doc, height=340, scrolling=False)
+    st.iframe(src="data:text/html;charset=utf-8," + urllib.parse.quote(doc), height=340)
 
 
 def _attach_node_weights(store: GraphStore) -> None:

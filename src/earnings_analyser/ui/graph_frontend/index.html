@@ -609,7 +609,7 @@ function init(args) {
 
   currentTransform = d3.zoomIdentity;
   const zoom = d3.zoom()
-    .scaleExtent([0.3, 6])
+    .scaleExtent([0.1, 8])
     .on("zoom", event => {
       currentTransform = event.transform;
       zoomLayer.attr("transform", currentTransform);
