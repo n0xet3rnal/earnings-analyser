@@ -392,7 +392,7 @@ def render_graph_phase() -> None:
     # made it into graph_nodes/graph_edges before rendering stopped syncing).
     with GraphStore(st.session_state["db_path"]) as store:
         last_level = _sync_graph_data(store)
-        if last_level > st.session_state["logged_level"]:
+        if last_level is not None and last_level > st.session_state["logged_level"]:
             st.session_state["logged_level"] = last_level
             st.session_state["analysis_log"].append(f"Level {last_level} composed")
         if status["done"] and status["error"] is None and "report" not in st.session_state:
