@@ -256,6 +256,7 @@ def _start_analysis(transcript_text: str = "", use_fixture: bool = False) -> Non
             status["calls_done"] += 1
 
     def _worker() -> None:
+        nonlocal transcript_text
         try:
             with GraphStore(db_path) as store:
                 if use_fixture:
