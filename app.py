@@ -466,7 +466,7 @@ def main() -> None:
     title_col, backend_col = st.columns([4, 1])
     with title_col:
         st.title("CallSense")
-        st.caption("Watch the evidence graph form, dimension by dimension: sentence-grounded, no composite score.")
+        st.caption("Explore the evidence graph, dimension by dimension: sentence-grounded, no composite score.")
     with backend_col:
         st.markdown(f"<div style='text-align:right;padding-top:1.2rem;color:#9C93B5;'>backend: <b>{backend}</b></div>", unsafe_allow_html=True)
 

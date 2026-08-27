@@ -2,7 +2,7 @@
 
 Analyzes earnings call transcripts across six linguistic dimensions drawn from academic research on analyst communication, and shows the reasoning as a live, explorable graph instead of a black-box score. Every conclusion cites specific, located sentences from the transcript. Nothing is asserted without a traceable, weighted path back to the source text.
 
-![Analysis view: the evidence graph, dimension tabs, weight filter, and transcript jump](docs/screenshots/analysis.png)
+![Analysis view: the evidence graph, dimension tabs, zoom control, and transcript jump](docs/screenshots/analysis.png)
 
 ## What it does
 
@@ -11,7 +11,7 @@ A transcript goes in (pasted text or a PDF upload), and the pipeline:
 1. Splits it into sentences, each with a real offset into the source text.
 2. Judges every sentence, in small groups, along six dimensions at once: **Forward Guidance, Uncertainty, Confidence, Sentiment, Macro Focus, Jargon**.
 3. Recursively summarizes and re-judges those groups' outputs, round after round, until each dimension converges to a handful of final, labeled conclusions.
-4. Renders the whole thing as a live graph that can be zoomed, panned, dragged, filtered by relevance, and clicked into, down to the exact sentence a conclusion is built from.
+4. Renders the whole thing as an explorable graph that can be zoomed, panned, dragged, and clicked into, down to the exact sentence a conclusion is built from.
 
 There is no single composite score. An earlier version of this project averaged the six dimensions into one weighted number. Those weights were never validated against anything, and averaging LLM-classified labels manufactures a precision that isn't there. This version keeps every dimension's conclusions separate, grounded, and cited.
 
@@ -38,24 +38,24 @@ Every call scores its own inputs' relevance (0-3, normalized to sum to 1 among s
 
 Everything is written to a SQLite (WAL-mode) graph store as it's produced (`persistence/graph_store.py`), nodes and edges, level by level, so a live viewer can read the graph while the pipeline is still building it, and an interrupted run resumes from the last completed level instead of restarting.
 
-### Weight, without the propagation artifact
-
-Every edge carries a real relevance weight from the model's own scoring. The obvious way to ask "how much does this sentence matter" is to chain those weights from a final conclusion back down to its sentences. That number shrinks with every hop and sibling a sentence's path happens to pass through, though, which is a tree-shape artifact rather than a relevance signal. `analysis/attribution.py`'s `compute_node_weights` instead scores only source sentences, using each one's own single-hop edge weight, peak-normalized across the dimension. Composites and terminal conclusions get no score of their own. The UI derives their visibility bottom-up: a composite stays lit as long as any sentence beneath it clears the weight threshold, and whole branches where nothing did go dark, which is the intended behavior of a relevance filter, not a bug.
-
 ### The graph UI
 
 The graph is a real bidirectional Streamlit component (`ui/graph_component.py`, `ui/graph_frontend/index.html`: plain D3 plus a hand-rolled Streamlit component protocol, no build tooling), not a redraw-on-every-poll `st.components.v1.html` blast. That distinction is what makes the rest of it possible:
 
-- **Streams in incrementally.** New nodes and edges get merged into the same running force simulation as levels complete. Nothing already on screen gets rebuilt or repositioned.
+- **Mounts once, fully formed.** Analysis itself runs behind a plain progress screen (see below); the graph component only mounts after the run completes, already holding every node and edge, so there's no half-built layout to reason about or jank to hide.
 - **Dimension focus is a pure restyle.** Selecting a dimension (vertical tabs, left of the theme cards) dims everything else to near-invisible and dulls the selected dimension's own resting color. Hovering a node lights it up along with its first-order neighbors in that dimension, tracing structure without ever touching the underlying simulation.
 - **A synthetic per-dimension hub** (no LLM, purely structural) links every terminal conclusion for a dimension, pulling a dimension's final themes visibly together instead of relying on a soft anchor force alone.
-- **A weight slider filters continuously**, client-side, driven by the `input` event, no Streamlit rerun involved, hiding source sentences below a relevance threshold and letting composite visibility fall out bottom-up as described above.
+- **A zoom slider mirrors the D3 zoom behavior both ways**: dragging it zooms the graph, and wheel or drag zooming on the canvas updates the slider, no Streamlit rerun involved either direction.
 - **Clicking a source sentence** jumps to and highlights its exact span in a transcript panel underneath, auto-scrolled into view.
 - Interactive throughout: zoom, pan, drag any node.
 
 ### Deterministic attribution for citations
 
-Separately from the weight-filter score, `compute_attribution` chains every round's relevance weights together (a weighted breadth-first walk from each terminal down to its leaves) to compute exactly how much each sentence explains that specific conclusion: a real, computable share, not just "cited or not." That's what powers the ranked evidence list under each theme card.
+Every edge carries a real relevance weight from the model's own scoring. `analysis/attribution.py`'s `compute_attribution` chains those weights together across every round (a weighted breadth-first walk from each terminal down to its leaves) to compute exactly how much each sentence explains a given conclusion: a real, computable share, not just "cited or not." That's what powers the ranked evidence list under each theme card.
+
+### Analysis screen: a progress log, not a half-built graph
+
+An earlier version streamed the graph live, mid-build, updating the force simulation every second as new levels landed. It looked good in a demo but was fragile in practice: node positions kept jumping as new evidence arrived, and there was nothing gained from watching it half-finished. The analysis screen now shows a plain progress bar and a growing log of what's completed ("Level 2 composed", and so on) until the run is done, then hands off to the fully-formed graph in one step. Once a run completes, its underlying SQLite graph store can be downloaded directly ("Save this run"), the same file the fixture-replay path below reads from.
 
 ## Project structure
 
@@ -121,11 +121,11 @@ Prefer `.venv/bin/python -m <tool>` over `.venv/bin/<tool>` directly. A venv's c
 .venv/bin/python -m streamlit run app.py
 ```
 
-Paste transcript text or upload a PDF, click Analyze, then watch the graph build. Once complete, pick a dimension from the left-side tabs, drag the weight slider to filter by relevance, and click any source sentence to jump to it in the transcript below.
+Paste transcript text or upload a PDF, click Analyze, and watch the progress log while it runs. Once complete, pick a dimension from the left-side tabs, use the zoom slider or your scroll wheel to navigate the graph, and click any source sentence to jump to it in the transcript below. A "Save this run" button downloads the completed run's graph store to replay or archive later.
 
 ### Trying it without spending API calls
 
-The input screen has a **"Test with sample data (no LLM call)"** button as an alternative to analyzing a real transcript. It replays `fixtures/sample_run.sqlite`, a real, production-size run already completed against `fixtures/sample_transcript.txt`, streaming it into the graph exactly like a live run (same pacing, same progressive reveal). This lets the whole UI get exercised repeatedly without touching a real backend or its rate limit. Regenerate that fixture (after a pipeline change, for example) with:
+The input screen has a **"Test with sample data (no LLM call)"** button as an alternative to analyzing a real transcript. It replays `fixtures/sample_run.sqlite`, a real, production-size run already completed against `fixtures/sample_transcript.txt`, at the same pace a live run would take. This lets the whole UI get exercised repeatedly without touching a real backend or its rate limit. Regenerate that fixture (after a pipeline change, for example) with:
 
 ```bash
 .venv/bin/python scripts/generate_ui_fixture.py
@@ -139,6 +139,6 @@ That script does make real calls against the configured backend. It's the one ti
 .venv/bin/python -m pytest tests/
 ```
 
-All tests are pure: no network or live model required. They cover sentence-split offset correctness (including window overlap), the graph store's read/write/resumability behavior, the compact-prompt parser's recovery from malformed model output, and the attribution/weight math (single-level weights, multi-level chains, multi-parent convergence, and the source-only weight scoring).
+All tests are pure: no network or live model required. They cover sentence-split offset correctness (including window overlap), the graph store's read/write/resumability behavior, the compact-prompt parser's recovery from malformed model output, and the attribution math (single-level weights, multi-level chains, and multi-parent convergence).
 
 ![Input view](docs/screenshots/input.png)
