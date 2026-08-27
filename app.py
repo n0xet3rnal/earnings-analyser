@@ -1,4 +1,4 @@
-"""Earnings Call Analyzer — Streamlit UI.
+"""CallSense: Streamlit UI.
 
 Run with: .venv/bin/streamlit run app.py
 Requires a local Ollama server running the configured model (see
@@ -60,7 +60,7 @@ DIMENSION_LABELS = {
     "jargon": "Jargon",
 }
 
-st.set_page_config(page_title="Earnings Call Analysis", layout="wide")
+st.set_page_config(page_title="CallSense", layout="wide")
 
 # Rounding/backoff and color come from .streamlit/config.toml's native theme
 # options; this covers only what theme.toml has no knob for — smooth hover/
@@ -458,8 +458,8 @@ def main() -> None:
 
     title_col, backend_col = st.columns([4, 1])
     with title_col:
-        st.title("Earnings Call Analysis")
-        st.caption("Watch the evidence graph form, dimension by dimension — sentence-grounded, no composite score.")
+        st.title("CallSense")
+        st.caption("Watch the evidence graph form, dimension by dimension: sentence-grounded, no composite score.")
     with backend_col:
         st.markdown(f"<div style='text-align:right;padding-top:1.2rem;color:#9C93B5;'>backend: <b>{backend}</b></div>", unsafe_allow_html=True)
 

@@ -1,4 +1,4 @@
-# Earnings Call Analysis
+# CallSense
 
 Analyzes earnings call transcripts across six linguistic dimensions drawn from academic research on analyst communication, and shows the reasoning as a live, explorable graph instead of a black-box score. Every conclusion cites specific, located sentences from the transcript. Nothing is asserted without a traceable, weighted path back to the source text.
 
